@@ -30,6 +30,7 @@ from .rmsnorm import EPS, rms_norm, golden_rms_norm
 from .quant import dequantize_mxfp4_cache, quantize_mxfp4_cache
 from .gemm import golden_dynamic_int8
 from .qkv_proj_rope import _rotate_rope, golden_rope_tail, golden_rope_interleave
+from .rope import make_pipelined_rope
 
 
 # model config
@@ -47,6 +48,10 @@ CANDIDATE_TOPK_BLOCKS = M.candidate_topk_blocks
 CANDIDATE_PAIR_WIDTH = 2 * CANDIDATE_TOPK_BLOCKS
 TOPK_CACHED_PAGES = (M.max_position_embeddings + 127) // 128
 
+
+rotate_index_query = make_pipelined_rope(
+    T_DYN, INDEX_H, INDEX_DIM, inverse=False, name_hint="prefill_index_rope", allow_early_resolve=False, inplace=True,
+)
 
 INDEX_SCORE_SCALE = INDEX_DIM ** -0.5 * INDEX_H ** -0.5
 INDEX_MAX_LOGITS_BYTES = 64 * 1024 * 1024
@@ -644,7 +649,10 @@ def prepare_prefill_index_query(
     tokens = pl.tensor.dim(x, 0)
     projected = pl.create_tensor([tokens, INDEX_H * INDEX_DIM], dtype=pl.BF16)
     gemm_dynamic_int8(latent, query_weight, query_weight_scale, projected, num_tokens, Q_LORA, INDEX_H * INDEX_DIM, "c1a_mx_projection", False)
-    rotated = _rotate_rope(projected, projected, cos, sin, 0, num_tokens, INDEX_H, INDEX_DIM, "prefill_index_rope", False, False)
+    if num_tokens >= 64:
+        rotated = rotate_index_query(projected, cos, sin, projected, num_tokens)
+    else:
+        rotated = _rotate_rope(projected, projected, cos, sin, 0, num_tokens, INDEX_H, INDEX_DIM, "prefill_index_rope", False, False)
     query_tid = quantize_index_query(rotated, query, query_scale, num_tokens, ready, dequantize=False)
     weights_tid = project_index_weights(x, weight_projection, weights, num_tokens)
     return query_tid, weights_tid
@@ -762,14 +770,20 @@ def _prefill_index_scores(
             total = total + (visible + tile_n - 1) // tile_n
             pl.write(prefix, [group + 1], pl.cast(total, pl.INT32))
 
-    output_panels = (width + 127) // 128
-    with pl.spmd(32, name_hint="prefill_index_score_clear", deps=[ready]) as clear_tid:
-        worker = pl.tile.get_block_idx()
-        for work in pl.range(worker, num_tokens * output_panels, 32):
-            token = work // output_panels
-            begin = (work % output_panels) * 128
-            clear_value = pl.reinterpret_view(pl.tile.full([1, 128], dtype=pl.INT32, value=-8388608), pl.FP32)
-            pl.store(pl.set_validshape(clear_value, 1, pl.min(128, width - begin)), [token, begin], output)
+    clear_deps = pl.array.create(1, pl.TASK_ID)
+    clear_deps[0] = plan_tid
+    if not skip_short:
+        # Scores beyond the last scheduled panel are observable in the dense score ABI.
+        with pl.spmd(32, name_hint="prefill_index_score_clear", deps=[plan_tid]) as clear_tid:
+            worker = pl.tile.get_block_idx()
+            floor_bits = pl.tile.full([1, 128], dtype=pl.INT32, value=-8388608)
+            floor = pl.reinterpret_view(floor_bits, pl.FP32)
+            for token in pl.range(worker, num_tokens, 32):
+                group = token // query_tile
+                panels = pl.read(prefix, [group + 1]) - pl.read(prefix, [group])
+                for begin in pl.range(panels * tile_n, width, 128):
+                    pl.store(pl.set_validshape(floor, 1, pl.min(128, width - begin)), [token, begin], output)
+        clear_deps[0] = clear_tid
 
     cache_pages = pl.tensor.dim(decoded_keys, 0) // 128
     query_rows = pl.tensor.dim(query, 0) * INDEX_H
@@ -789,7 +803,7 @@ def _prefill_index_scores(
             pl.store(pl.reshape(scaled, [16, INDEX_DIM]), [first_head, 0], query_bf16)
     table_width = pl.tensor.dim(block_table, 1)
     requests = pl.tensor.dim(block_table, 0)
-    with pl.spmd(32, name_hint="prefill_index_mx_scores", deps=[plan_tid, clear_tid, query_ready],
+    with pl.spmd(32, name_hint="prefill_index_mx_scores", deps=[clear_deps[0], query_ready],
                  optimizations=[pl.cross_core_slot(slot_num=1)]) as score_tid:
         worker = pl.tile.get_block_idx()
         work_items = pl.cast(pl.read(prefix, [groups]), pl.INDEX)

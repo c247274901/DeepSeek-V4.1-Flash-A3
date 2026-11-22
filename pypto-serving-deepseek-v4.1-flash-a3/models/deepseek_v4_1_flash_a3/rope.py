@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Pipelined rotary position embedding for the A3 output projection."""
+"""Pipelined rotary position embedding for the A3 attention projections."""
 
 import pypto.language as pl
 
@@ -14,10 +14,13 @@ import pypto.language as pl
 ROPE_WORKER_LIMIT = 48
 
 
-def make_pipelined_rope(capacity, heads, head_dim, *, inverse, name_hint, allow_early_resolve):
-    """Rotate groups of heads sharing one token's coefficients."""
+def make_pipelined_rope(capacity, heads, head_dim, *, inverse, name_hint, allow_early_resolve, inplace=False):
+    """Rotate heads sharing a token's coefficients. In-place callers pass x as output."""
     width = heads * head_dim
     nope = head_dim - 64
+    load_start = nope if inplace else 0
+    load_width = head_dim - load_start
+    tail_start = nope - load_start
     rows = min(heads, 32)
     elements = rows * 64
     direction = -1.0 if inverse else 1.0
@@ -50,8 +53,8 @@ def make_pipelined_rope(capacity, heads, head_dim, *, inverse, name_hint, allow_
             for block in pl.pipeline(start, end, stage=2):
                 row = block * rows
                 token = row // heads
-                block_value = pl.load(source, [row, 0], [rows, head_dim])
-                value = pl.cast(pl.tile.slice(block_value, [rows, 64], [0, nope]), pl.FP32)
+                block_value = pl.load(source, [row, load_start], [rows, load_width])
+                value = pl.cast(pl.tile.slice(block_value, [rows, 64], [0, tail_start]), pl.FP32)
                 swap_tmp = pl.create_tile([1, elements], dtype=pl.INT32, target_memory=pl.Mem.Vec)
                 swapped = pl.tile.gather(pl.reshape(value, [1, elements]), swap_idx, swap_tmp)
                 coeff_tmp = pl.create_tile([1, 64], dtype=pl.INT32, target_memory=pl.Mem.Vec)
@@ -60,8 +63,11 @@ def make_pipelined_rope(capacity, heads, head_dim, *, inverse, name_hint, allow_
                 direct = pl.col_expand_mul(value, c)
                 cross = pl.col_expand_mul(pl.reshape(swapped, [rows, 64]), s)
                 rotated = pl.cast(pl.add(direct, cross), pl.BF16, mode="rint")
-                combined = pl.tile.assemble(block_value, rotated, [0, nope])
-                pl.store(combined, [row, 0], target)
+                if inplace:
+                    pl.store(rotated, [row, nope], target)
+                else:
+                    combined = pl.tile.assemble(block_value, rotated, [0, nope])
+                    pl.store(combined, [row, 0], target)
         return output
 
     return rope

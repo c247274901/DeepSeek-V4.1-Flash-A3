@@ -85,6 +85,7 @@ GATHER_WORKERS = 64
 SELECTED_GATHER_TILE = 32
 CACHE_WORKERS = 32
 WINDOW_PUBLISH_WORKER_TILE = 12
+PREFILL_WINDOW_ROW_TILE = 64
 SHARED_GATHER_WORKERS = 64
 CACHE_MAX_ROWS = 32768
 PACKED_QUERY_TILE = 32
@@ -120,9 +121,12 @@ def prefill_publish_window(
     cache_rows = pl.tensor.dim(cache, 0) * 128
     flat = pl.reshape(cache, [cache_rows, HEAD_DIM])
     scale_flat = pl.reshape(scales, [cache_rows, HEAD_DIM // 32])
-    with pl.spmd(num_tokens, name_hint="pub_win", deps=[cache_ready]) as publish_tid:
-        t = pl.tile.get_block_idx()
-        _publish_window_row(kv, slots, flat, scale_flat, t)
+    rows_per_block = pl.max(1, pl.min(PREFILL_WINDOW_ROW_TILE, num_tokens // 32))
+    blocks = (num_tokens + rows_per_block - 1) // rows_per_block
+    with pl.spmd(blocks, name_hint="pub_win", deps=[cache_ready]) as publish_tid:
+        begin = pl.tile.get_block_idx() * rows_per_block
+        for t in pl.range(begin, pl.min(num_tokens, begin + rows_per_block)):
+            _publish_window_row(kv, slots, flat, scale_flat, t)
     return publish_tid
 
 

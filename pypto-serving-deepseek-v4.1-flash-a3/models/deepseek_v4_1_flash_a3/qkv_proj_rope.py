@@ -17,6 +17,7 @@ from .blocked_rmsnorm import make_blocked_rmsnorm
 from .config import FLASH as M, T_DYN, TP_SIZE
 from .gemm import gemm_int8, golden_dynamic_int8
 from .rmsnorm import golden_rms_norm, rms_norm
+from .rope import make_pipelined_rope
 
 
 # model config
@@ -32,6 +33,10 @@ Q_A_N_TILE = 64
 Q_B_N_TILE = 256
 KV_N_TILE = 64
 ROPE_WORKER_TILE = 32
+
+rotate_prefill_q = make_pipelined_rope(
+    T_DYN, LOCAL_H, HEAD_DIM, inverse=False, name_hint="attention_q_rope", allow_early_resolve=False, inplace=True,
+)
 
 normalize_q = make_blocked_rmsnorm(T_DYN, Q_LORA, EPS, dynamic_rows=True)
 normalize_kv = make_blocked_rmsnorm(T_DYN, HEAD_DIM, EPS, dynamic_rows=True)
@@ -122,7 +127,10 @@ def make_q_proj_rope(*, prefill):
                 rms_norm(projected, q_norm_weight, query_latent, worker, num_tokens, width=Q_LORA)
         qb_payload, qb_scales = quantize_projection_activation(query_latent, num_tokens, Q_LORA, prefill)
         gemm_int8(qb_payload, qb_scales, wq_b, wq_b_scale, query, num_tokens, Q_LORA, LOCAL_H * HEAD_DIM, "proj_q_b", Q_B_N_TILE, 256, False)
-        query = _rotate_rope(query, query, rope_cos, rope_sin, 0, num_tokens, LOCAL_H, HEAD_DIM, "attention_q_rope", False, False)
+        if prefill and num_tokens >= 64:
+            query = rotate_prefill_q(query, rope_cos, rope_sin, query, num_tokens)
+        else:
+            query = _rotate_rope(query, query, rope_cos, rope_sin, 0, num_tokens, LOCAL_H, HEAD_DIM, "attention_q_rope", False, False)
         return query_latent, query, qb_payload, qb_scales
 
     return q_proj_rope
