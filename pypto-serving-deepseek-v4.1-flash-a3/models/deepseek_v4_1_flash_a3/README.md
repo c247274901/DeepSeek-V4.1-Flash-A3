@@ -2,7 +2,7 @@
 
 The default text-generation path runs two handwritten PyPTO programs on 16 A3
 devices (DP4, TP4, EP16). Each program owns its layer schedule and calls the
-phase-specific operators in `operators/`. One request runs in one TP group.
+phase-specific operators beside the forward entries. One request runs in one TP group.
 All sixteen ranks participate in expert communication.
 
 | | Prefill | Decode |
@@ -10,7 +10,7 @@ All sixteen ranks participate in expert communication.
 | Distributed entry | `prefill_fwd.l3_prefill_fwd` binds rank-local slices and communication windows | `decode_fwd.l3_decode_fwd` binds Decode views, valid counts and windows |
 | Per-rank schedule | `l2_prefill_fwd` iterates the requested layer range, normally 0 through 39 | `l2_decode_fwd` runs `decode_encoder` (0–19) and `decode_decoder` (20–39) |
 | Attention | Explicit modes 0–5 select SWA, C2A full, C2A reuse, C1A reindex across history, C1A reindex using candidates, and C1A reuse | The encoder and decoder call Decode-specific SWA, C2A and C1A kernels |
-| MoE | Each round admits 64 or 128 rows per TP rank, as selected at compile time. The graph routes to EP16, synchronizes dispatch and combine, and reuses its temporary slabs across rounds and layers | Graph-local expert dispatch and combine use the Decode valid counts and resident expert weights |
+| MoE | The compile-time MoE slab ranges from 64 to 2048 rows per TP rank. The graph routes to EP16, synchronizes dispatch and combine, and reuses its temporary slabs across rounds and layers | Graph-local expert dispatch and combine use the Decode valid counts and resident expert weights |
 | Input | Prepared embedding and Engram rows, positions, page tables, weights and typed cache tensors | Hidden and pre-mix rows, metadata, weights and views of the same caches. Single-request generation compiles a 16-row input allocation per active rank. The general Decode artifact has 80 rows |
 
 The L3 signatures expose 87 tensor parameters for Prefill and 74 for Decode.
@@ -56,21 +56,19 @@ windows. For reusable generation artifacts, add `--prepare-windows` to both
 vocabulary vector for each emitted token.
 
 For the bundled 8192-token replay, build Prefill with `--capacity 8192`
-and `--prefill-moe-slab-rows 128`, Decode with `--decode-capacity 16`, and both
+and `--prefill-moe-slab-rows 2048`, Decode with `--decode-capacity 16`, and both
 programs with `--context-capacity 8200`. Run the compiled pair with
 
 ```bash
 python -m "$model.prefill_fwd" --checkpoint "$CHECKPOINT" --devices "$TASK_DEVICE" \
   --runtime-dir "$GRAPH_DIR/prefill" --decode-runtime-dir "$GRAPH_DIR/decode" \
-  --input-ids-json models/deepseek_v4_1_flash_a3/validation_data/input_ids.json \
-  --prefill-moe-slab-rows 128 --chunk-size 8192 --max-new-tokens 8 --ignore-eos --output "$RUN_DIR"
+  --input-ids-json models/deepseek_v4_1_flash_a3/input_ids.json \
+  --prefill-moe-slab-rows 2048 --chunk-size 8192 --max-new-tokens 8 --ignore-eos --output "$RUN_DIR"
 ```
 
-## Staged session
+## Validate logits
 
-Use `generate --staged-network` for the host-scheduled session. Packed batches,
-all-position logits, a 16-row Prefill MoE slab and staged chip profiling also
-select this path. Its JSON entry is `staged_prefill --config FILE`. The
-standalone staged Decode and bounded SWA entries are `decode_network` and
-`bounded_decode`. See the [ownership map](MODULE_ALIGNMENT.md) and the
-[staged session documentation](../../docs/models/deepseek_v4_1_flash_a3/index.md).
+The accuracy collector uses the same Prefill and Decode entry points as generation.
+It feeds the prepared trace token into each Decode step and records full-vocabulary
+FP32 logits. See the [fixed-trace comparison](../../docs/models/deepseek_v4_1_flash_a3/accuracy.md)
+and the [module map](MODULE_ALIGNMENT.md).

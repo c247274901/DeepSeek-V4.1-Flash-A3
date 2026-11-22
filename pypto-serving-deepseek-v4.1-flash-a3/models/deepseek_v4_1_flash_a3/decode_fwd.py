@@ -19,9 +19,9 @@ if not __package__:
 
 import argparse
 import pypto.language as pl
-from .operators.config import TP_SIZE
+from .config import TP_SIZE
 import pypto.language.distributed as pld
-from .operators import config as C
+from . import config as C
 
 _shape_parser = argparse.ArgumentParser(add_help=False)
 _shape_parser.add_argument("--decode-capacity", type=int, choices=[16, C.DECODE_INPUT_MAX_TOKENS],
@@ -38,25 +38,25 @@ if _shape_options.experts_per_rank != C.N_LOCAL_EXPERTS:
 DECODE_CAPACITY = _shape_options.decode_capacity
 C.set_moe_tokens(16 if DECODE_CAPACITY == 16 else 64)
 
-from .operators.config import (
+from .config import (
     FLASH as M, B_DYN, LOCAL_T_DYN, Q_START_DYN, ROUTE_T_DYN, T_DYN, BLOCK_SIZE, COMPRESSED_CACHE_GROUP,
     DECODE_MAX_TOKENS, INDEX_CACHE_GROUP, STATE_CAPACITY, WINDOW_CACHE_GROUP,
     MOE_TOKENS,
 )
-from .operators.compressor import STATE_WIDTH
-from .operators.moe import ROUTED_RECV_ROWS, prefill_moe_sublayer, prefill_ffn_restore
-from .operators.o_proj import retire_prefill_signals
-from .operators.decode_c1a_full import decode_c1a_full
-from .operators.decode_c1a_reindex import decode_c1a_reindex
-from .operators.decode_c1a_reuse import decode_c1a_reuse
-from .operators.decode_c2a_full import decode_c2a_full
-from .operators.decode_c2a_reuse import decode_c2a_reuse
-from .operators.decode_swa import decode_swa
-from .operators.input_pack import prepare_compressed_lens
-from .operators.lm_head import GROUP_LOGIT_ROWS, MAX_LOGIT_ROWS, SAMPLED_IDS_PAD, VOCAB, VOCAB_PER_TP, final_output
-from .operators.rope_tables import ROPE_ROWS_DYN, materialize_rope_rows
-from .operators.engram import ENGRAM_K, KV_OUT, engram_from_rows
-from .operators.moe import (
+from .compressor import STATE_WIDTH
+from .moe import ROUTED_RECV_ROWS, prefill_moe_sublayer, prefill_ffn_restore
+from .o_proj import retire_prefill_signals
+from .decode_c1a_full import decode_c1a_full
+from .decode_c1a_reindex import decode_c1a_reindex
+from .decode_c1a_reuse import decode_c1a_reuse
+from .decode_c2a_full import decode_c2a_full
+from .decode_c2a_reuse import decode_c2a_reuse
+from .decode_swa import decode_swa
+from .input_pack import prepare_compressed_lens
+from .lm_head import GROUP_LOGIT_ROWS, MAX_LOGIT_ROWS, SAMPLED_IDS_PAD, VOCAB, VOCAB_PER_TP, final_output
+from .rope_tables import ROPE_ROWS_DYN, materialize_rope_rows
+from .engram import ENGRAM_K, KV_OUT, engram_from_rows
+from .moe import (
     SIGNAL_PAD, clear_moe_signals, AUX_WIDTH, EP_SIZE, N_LOCAL_EXPERTS,
 )
 

@@ -9,6 +9,7 @@
 """Compile the A3 prefill/decode ABI and validate artifact compatibility."""
 
 import argparse
+import ast
 import hashlib
 import inspect
 import json
@@ -20,7 +21,7 @@ import torch
 from golden import ScalarSpec, TensorSpec, run
 from pypto.ir import DistributedConfig
 
-from .operators import config as C
+from . import config as C
 
 
 TOPOLOGY = {"world": 16, "dp": 4, "tp": 4, "ep": 16, "local_experts": 24}
@@ -70,12 +71,21 @@ def build_specs(function, *, mode, capacity, history_capacity=HISTORY_CAPACITY, 
 def manifest(mode, capacity, history_capacity=HISTORY_CAPACITY, *, slab_rows=64):
     """Version the shared weight, cache and quantization ABI."""
     root = Path(__file__).parent
-    paths = [root / name for name in (
-        "prefill_fwd.py", "decode_fwd.py", "driver.py", "rmsnorm.py", "rope.py",
-        "quant.py", "config.py", "operator_config.py",
-    )]
-    paths.extend(sorted((root / "operators").glob("*.py")))
-    sources = {str(path.relative_to(root)): hashlib.sha256(path.read_bytes()).hexdigest() for path in paths}
+    pending = ["prefill_fwd", "decode_fwd", "driver"]
+    sources = {}
+    while pending:
+        name = pending.pop()
+        path = root / f"{name}.py"
+        if path.name in sources:
+            continue
+        source = path.read_bytes()
+        sources[path.name] = hashlib.sha256(source).hexdigest()
+        for node in ast.walk(ast.parse(source)):
+            if isinstance(node, ast.ImportFrom) and node.level == 1:
+                if node.module:
+                    pending.append(node.module)
+                else:
+                    pending.extend(alias.name for alias in node.names)
     return {"format": "deepseek-v41-a3-artifact-v1", "platform": "a2a3", "mode": mode,
             "topology": TOPOLOGY, "moe_slab_rows": slab_rows, "capacity": capacity, "history_capacity": history_capacity,
             "weight_layout": C.WEIGHT_LAYOUT_VERSION, "cache_layout": C.CACHE_LAYOUT_VERSION,
@@ -103,8 +113,7 @@ def load_manifest(directory, *, mode, capacity=None):
 
 
 def main(function, *, mode, capacity, argv=None):
-    parser = argparse.ArgumentParser(description=__doc__, epilog=(
-        "Use generate --staged-network for the host-scheduled session." if function is None else None))
+    parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("-p", "--platform", choices=["a2a3"], default="a2a3")
     parser.add_argument("-d", "--device", "--devices", dest="devices", default=",".join(map(str, range(16))))
     parser.add_argument("--tp", type=int, choices=[4], default=4)

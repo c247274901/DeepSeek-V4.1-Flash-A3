@@ -6,288 +6,238 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Host weight layouts, device descriptor transfers, scheduling and file utilities."""
+"""Metadata lowering and shared validation helpers for prefill and decode."""
 
-import hashlib
-import json
-from pathlib import Path
+from collections.abc import Callable
+
 import torch
 
 
-INT8_SCALE_MAX = 127.0
-INT8_AMAX_EPS = 1e-4
+from . import config as C
+from .config import BLOCK_SIZE, FLASH as M, TP_SIZE
+from golden import ScalarSpec
 
 
-NZ_FRACTAL_ROWS = 16
+def parse_decode_startpos(value):
+    """Parse one absolute starting position per request."""
+    import argparse
+
+    try:
+        positions = [int(item) for item in value.split(",")]
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("start-pos must be a comma-separated list of integers") from error
+    limit = min(C.MAX_BATCH_PER_DP, C.DECODE_MAX_TOKENS)
+    if not 1 <= len(positions) <= limit:
+        raise argparse.ArgumentTypeError(f"start-pos must contain between 1 and {limit} positions")
+    max_start = M.max_position_embeddings - 1
+    if any(position < 0 or position > max_start for position in positions):
+        raise argparse.ArgumentTypeError(f"positions must be in [0, {max_start}]")
+    return positions
 
 
-NZ_C0_BYTES = 32
+def parse_decode_query_lens(value):
+    """Parse positive query lengths in request order."""
+    import argparse
+
+    try:
+        lengths = [int(item) for item in value.split(",")]
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("query-lens must be a comma-separated list of integers") from error
+    if any(length <= 0 for length in lengths):
+        raise argparse.ArgumentTypeError("query-lens must contain positive lengths")
+    return lengths
 
 
-BLOCKED_INT8_COLUMNS = 64
-
-
-WINDOW_HEADS = 64
-WINDOW_HEAD_DIM = 512
-WINDOW_PAGE_ROWS = WINDOW_SIZE = 128
-SCHEDULE_INT32_MAX = (1 << 31) - 1
-
-
-def validate_golden_active(golden_data, active):
-    """Require saved runtime controls to match active-prefix comparator bounds."""
-    if golden_data is None:
+def configure_decode_workload(args, parser):
+    """Resolve query lengths, packed token count, and absolute position bounds."""
+    if args.startpos is None:
+        if args.query_lens is not None:
+            parser.error("--query-lens requires --start-pos")
         return
-    saved = torch.load(Path(golden_data) / "in" / "active.pt", map_location="cpu", weights_only=True)
-    if not isinstance(saved, torch.Tensor) or saved.ndim != 0 or saved.dtype != torch.int32:
-        raise ValueError("Golden active.pt must be a scalar INT32 tensor")
-    if int(saved) != active:
-        raise ValueError(f"Golden active={int(saved)} does not match the selected active={active}")
+    args.requests = len(args.startpos)
+    if args.query_lens is None:
+        args.query_lens = [C.DECODE_ROWS_PER_REQUEST] * args.requests
+    if len(args.query_lens) != args.requests:
+        parser.error("--query-lens must contain one length per --start-pos value")
+    args.tokens = sum(args.query_lens)
+    if args.tokens > C.DECODE_MAX_TOKENS:
+        parser.error(f"total query tokens must not exceed {C.DECODE_MAX_TOKENS}")
+    ends = [pos + length for pos, length in zip(args.startpos, args.query_lens)]
+    if max(ends) > M.max_position_embeddings:
+        parser.error("a query block exceeds max_position_embeddings")
 
 
-def allocate_runtime_tensor(runtime, shape, dtype, rank, *, fill=0):
-    """Allocate scratch through its owner, with no fill for complete overwrites."""
-    allocate = runtime.get("workspace")
-    if allocate is not None:
-        return allocate(shape, dtype, rank, fill=fill)
-    return torch.empty(shape, dtype=dtype) if fill is None else torch.full(shape, fill, dtype=dtype)
+def packed_query_lengths(tokens, requests, query_lens=None):
+    """Use explicit request lengths or a balanced packed token split."""
+    if query_lens is None:
+        return [tokens // requests + (index < tokens % requests) for index in range(requests)]
+    if len(query_lens) != requests or sum(query_lens) != tokens or any(length <= 0 for length in query_lens):
+        raise ValueError("query_lens must contain one positive length per request and sum to tokens")
+    return list(query_lens)
 
 
-def copy_runtime_tensor(runtime, destination, source, rank):
-    """Copy an activation view through its execution owner's transfer callback."""
-    copy = runtime.get("copy_tensor")
-    if copy is None:
-        destination.copy_(source)
-    else:
-        copy(destination, source, rank)
-    return destination
+def paged_slots(
+    positions: torch.Tensor,
+    request_ids: torch.Tensor,
+    block_table: torch.Tensor,
+    storage_block_size: int = BLOCK_SIZE,
+    logical_divisor: int = 1,
+    publish_only_complete: bool = False,
+) -> torch.Tensor:
+    """Map logical token positions to flattened physical cache rows."""
+    if positions.ndim != 1 or request_ids.shape != positions.shape or block_table.ndim != 2:
+        raise ValueError("positions/request_ids must be matching vectors and block_table must be a matrix")
+    if storage_block_size <= 0 or logical_divisor <= 0:
+        raise ValueError("storage_block_size and logical_divisor must be positive")
+    if any(value.dtype not in (torch.int32, torch.int64) for value in (positions, request_ids, block_table)):
+        raise ValueError("positions, request_ids and block_table must contain integer indices")
+    partial = publish_only_complete and logical_divisor > 1
+    active_positions, active_requests = positions, request_ids
+    if partial:
+        publish = (positions + 1).remainder(logical_divisor) == 0
+        active_positions, active_requests = positions[publish], request_ids[publish]
+    logical = torch.div(active_positions, logical_divisor, rounding_mode="floor")
+    logical_block = torch.div(logical, storage_block_size, rounding_mode="floor")
+    offset = logical.remainder(storage_block_size)
+    if bool(((active_requests < 0) | (active_requests >= block_table.shape[0])).any()):
+        raise ValueError("published request id is outside the block table")
+    if bool(((logical_block < 0) | (logical_block >= block_table.shape[1])).any()):
+        raise ValueError("block table does not cover a required logical page")
+    physical = block_table[active_requests.long(), logical_block.long()]
+    if bool((physical < 0).any()):
+        raise ValueError("required logical page has no physical allocation")
+    mapped = physical.long() * storage_block_size + offset.long()
+    if partial:
+        slots = torch.full_like(positions, -1, dtype=torch.int64)
+        slots[publish] = mapped
+        return slots
+    return mapped
 
 
-def read_runtime_control(runtime, value, rank):
-    """Materialize integer execution controls for host validation and scheduling."""
-    read = runtime.get("read_control")
-    return value if read is None or not value.numel() else read(value, rank)
+def window_metadata(
+    positions: torch.Tensor,
+    request_ids: torch.Tensor,
+    block_table: torch.Tensor,
+    window: int = M.sliding_window,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build paged write slots plus causal indices for the visible sliding window."""
+    slots = paged_slots(positions, request_ids, block_table)
+    lens = torch.minimum(positions + 1, torch.full_like(positions, window)).to(torch.int32)
+    offsets = torch.arange(window, device=positions.device)
+    starts = positions - lens.to(positions.dtype) + 1
+    visible = starts.unsqueeze(-1) + offsets
+    valid = offsets.unsqueeze(0) < lens.unsqueeze(-1)
+    safe_positions = torch.minimum(visible, positions.unsqueeze(-1))
+    pages = torch.div(safe_positions, BLOCK_SIZE, rounding_mode="floor")
+    physical = block_table[request_ids.long().unsqueeze(-1), pages]
+    if bool((physical < 0).any()):
+        raise ValueError("required logical page has no physical allocation")
+    indices = physical.long() * BLOCK_SIZE + safe_positions.remainder(BLOCK_SIZE)
+    return slots, indices.masked_fill_(~valid, -1).int(), lens
 
 
-def pack_blocked_weight(weight_kn: torch.Tensor, *, out: torch.Tensor | None = None) -> torch.Tensor:
-    """Pack CPU INT8 ``[K, N]`` into ``[N/64, K, 64]`` flattened to 2D.
+def upload_forward_inputs(runtime, specs, parameters, ranks, host_inputs, upload_buffer):
+    """Upload rank-local storage through a shared buffer registered before runtime preparation."""
+    from pypto.ir import ParamDirection
+    from pypto.runtime import StackedDeviceTensor
 
-    This is the A3 blocked GEMM operand, distinct from the NZ expert layout.
-    Only byte order changes; checkpoint scales and offsets stay separate.
-    With `out`, a single-threaded strided copy fills the supplied CPU buffer.
-    """
-    if weight_kn.device.type != "cpu" or weight_kn.dtype != torch.int8 or weight_kn.ndim != 2:
-        raise ValueError("Blocked weights require a CPU INT8 [K, N] tensor")
-    rows, columns = weight_kn.shape
-    if rows <= 0 or columns <= 0 or rows % 256 or columns % BLOCKED_INT8_COLUMNS:
-        raise ValueError("Blocked weights require positive K/256 and N/64")
-    blocks = columns // BLOCKED_INT8_COLUMNS
-    blocked = weight_kn.reshape(rows, blocks, BLOCKED_INT8_COLUMNS).permute(1, 0, 2)
-    shape = (rows * blocks, BLOCKED_INT8_COLUMNS)
-    if out is None:
-        return blocked.contiguous().view(shape)
-    if out.device.type != "cpu" or out.dtype != torch.int8 or out.shape != shape or not out.is_contiguous():
-        raise ValueError("Blocked weight destination must be a contiguous CPU INT8 tensor of the packed shape")
-    out.view_as(blocked).numpy()[...] = blocked.numpy()
-    return out
-
-
-def unpack_blocked_weight(packed: torch.Tensor, input_width: int, output_width: int) -> torch.Tensor:
-    """Restore the logical ``[K, N]`` weight for Torch golden computation."""
-    if input_width <= 0 or output_width <= 0 or input_width % 256 or output_width % BLOCKED_INT8_COLUMNS:
-        raise ValueError("Blocked weights require positive K/256 and N/64")
-    blocks = output_width // BLOCKED_INT8_COLUMNS
-    if packed.dtype != torch.int8 or tuple(packed.shape) != (input_width * blocks, BLOCKED_INT8_COLUMNS):
-        raise ValueError("Packed weight shape does not match the logical K and N")
-    return (
-        packed.reshape(blocks, input_width, BLOCKED_INT8_COLUMNS)
-        .permute(1, 0, 2)
-        .contiguous()
-        .reshape(input_width, output_width)
-    )
-
-
-def pack_nz(logical: torch.Tensor) -> torch.Tensor:
-    """Reorder the trailing ``[R, C]`` of a row-major tensor into NZ fractal order."""
-    rows, cols = logical.shape[-2:]
-    c0 = NZ_C0_BYTES // logical.element_size()
-    if rows % NZ_FRACTAL_ROWS:
-        raise ValueError(f"NZ needs {NZ_FRACTAL_ROWS}-row fractals, got {rows} rows")
-    if cols % c0:
-        raise ValueError(f"NZ needs whole C0 lines of {c0} elements, got {cols} cols")
-    blocked = logical.reshape(-1, rows // NZ_FRACTAL_ROWS, NZ_FRACTAL_ROWS, cols // c0, c0)
-    return blocked.permute(0, 3, 1, 2, 4).contiguous().reshape(logical.shape)
+    chunk_bytes = upload_buffer.numel()
+    arguments = []
+    for spec, parameter in zip(specs, parameters, strict=True):
+        if isinstance(spec, ScalarSpec):
+            arguments.append(spec.to_python())
+            continue
+        if spec.name in host_inputs:
+            arguments.append(host_inputs[spec.name])
+            continue
+        shape = spec.shape[1:]
+        if spec.shape[0] != ranks:
+            raise ValueError(f"{spec.name} needs a leading rank axis of size {ranks}")
+        shards = []
+        for rank in range(ranks):
+            handle = runtime.alloc_tensor(shape, spec.dtype, worker_id=rank)
+            shards.append(handle)
+            if parameter.direction == ParamDirection.Out:
+                continue
+            tensor_value = isinstance(spec.init_value, torch.Tensor)
+            if tensor_value:
+                if list(spec.init_value.shape) != spec.shape:
+                    raise ValueError(f"{spec.name} initialization must match its tensor spec")
+                value = spec.init_value[rank].contiguous().view(torch.uint8).reshape(-1)
+            else:
+                fill = 0 if spec.init_value is None else spec.init_value
+                active_buffer = upload_buffer[:min(chunk_bytes, handle.nbytes)]
+                if spec.dtype == torch.float8_e8m0fnu:
+                    code = torch.tensor(float(fill)).to(spec.dtype).view(torch.uint8).item()
+                    active_buffer.fill_(code)
+                else:
+                    active_buffer.view(spec.dtype).fill_(fill)
+            for offset in range(0, handle.nbytes, chunk_bytes):
+                size = min(chunk_bytes, handle.nbytes - offset)
+                if tensor_value:
+                    upload_buffer[:size].copy_(value[offset:offset + size])
+                runtime.copy_to(handle.data_ptr, upload_buffer.data_ptr(), size, dst_offset=offset, worker_id=rank)
+        arguments.append(StackedDeviceTensor(shards, tuple(spec.shape), tuple(range(ranks))))
+    return arguments
 
 
-def unpack_nz(packed: torch.Tensor) -> torch.Tensor:
-    """Restore NZ-ordered bytes to the logical row-major ``[..., R, C]`` tensor."""
-    rows, cols = packed.shape[-2:]
-    c0 = NZ_C0_BYTES // packed.element_size()
-    blocked = packed.reshape(-1, cols // c0, rows // NZ_FRACTAL_ROWS, NZ_FRACTAL_ROWS, c0)
-    return blocked.permute(0, 2, 3, 1, 4).contiguous().reshape(packed.shape)
+def token_shards(value, local_tokens):
+    """Pad scheduled rows and split them in contiguous TP rank order."""
+    padded = value.new_zeros(TP_SIZE * local_tokens, *value.shape[1:])
+    padded[:value.shape[0]].copy_(value)
+    return padded.reshape(TP_SIZE, local_tokens, *value.shape[1:])
 
 
-def int8_quant_per_row(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Per-row INT8 symmetric quant matching the runtime W8A8C16 activation path.
-
-    Rounds to int8 through fp16 to match the device rounding; returns the
-    per-row dequant scale (``1 / scale_quant``).
-    """
-    rows = x.float().reshape(-1, x.shape[-1])
-    amax = rows.abs().amax(dim=-1, keepdim=True).clamp_min(INT8_AMAX_EPS)
-    # Explicit division preserves half-amax ties as in device pl.div.
-    scale_quant = torch.div(torch.full_like(amax, INT8_SCALE_MAX), amax)
-    scaled = rows * scale_quant
-    out_i8 = torch.round(scaled).to(torch.int32).to(torch.float16).to(torch.int8)
-    scale_dequant = 1.0 / scale_quant
-    return out_i8.reshape_as(x), scale_dequant.reshape(*x.shape[:-1], 1)
+def _copy_cache_rows(destination: torch.Tensor, source: torch.Tensor, rows: torch.Tensor) -> None:
+    destination_rows = destination.flatten(0, 1).view(torch.uint8)
+    source_rows = source.contiguous().view(torch.uint8).reshape_as(destination_rows[rows])
+    destination_rows[rows] = source_rows
 
 
-def file_sha(path):
-    """Hash a source, runtime library, or staging artifact."""
-    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+def _publish_quantized_cache(
+    payload: torch.Tensor,
+    scale: torch.Tensor,
+    values: torch.Tensor,
+    slots: torch.Tensor,
+    quantize: Callable[[torch.Tensor], tuple[torch.Tensor, torch.Tensor]],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize and replace only mapped rows in a packed cache pair."""
+    updated_payload = payload.clone()
+    updated_scale = scale.clone()
+    valid = slots >= 0
+    rows = slots[valid].to(torch.int64)
+    if rows.numel():
+        row_payload, row_scale = quantize(values[valid])
+        _copy_cache_rows(updated_payload, row_payload, rows)
+        _copy_cache_rows(updated_scale, row_scale, rows)
+    return updated_payload, updated_scale
 
 
-def tensor_sha(value):
-    """Hash actual contiguous CPU tensor bytes, including BF16 payloads."""
-
-    return hashlib.sha256(value.contiguous().view(torch.uint8).numpy().tobytes()).hexdigest()
-
-
-def write_json(path, value):
-    path.write_text(json.dumps(value, indent=2) + "\n")
+DECODE_CACHE_NAMES = {
+    "window_cache_pool": "window_cache", "window_cache_scale_pool": "window_scales",
+    "compressed_cache_pool": "compressed_cache", "compressed_cache_scale_pool": "compressed_scales",
+    "index_cache_pool": "index_cache", "index_cache_scale_pool": "index_scales",
+    "state_cache_pool": "state_cache",
+}
 
 
-def _require_schedule(condition, message):
-    """Reject controls that violate the original native operator contract."""
-    if not condition:
-        raise RuntimeError(message)
+def decode_cache_views(cache_state):
+    """Alias contiguous prefill storage as decode pools by flattening source/page axes."""
+    return {target: cache_state[source].flatten(0, 1) for target, source in DECODE_CACHE_NAMES.items()}
 
 
-def _schedule_integer(value, *, minimum=0):
-    _require_schedule(
-        type(value) is int and minimum <= value <= SCHEDULE_INT32_MAX,
-        "A bounded exact integer scheduler control is required",
-    )
-    return value
-
-
-def build_window_schedule(query_lengths, prefix_lengths, block_table, *, cache_blocks, capacity,
-                          rolling_pages=False):
-    """Derive physical windows and publications for every request and active row."""
-    _schedule_integer(cache_blocks, minimum=1)
-    _require_schedule(
-        cache_blocks * WINDOW_PAGE_ROWS <= SCHEDULE_INT32_MAX,
-        "Physical window indices must fit the original INT32 ABI",
-    )
-    _schedule_integer(capacity, minimum=1)
-    _require_schedule(
-        type(query_lengths) is list
-        and type(prefix_lengths) is list
-        and type(block_table) is list
-        and len(query_lengths) == len(prefix_lengths) == len(block_table),
-        "Explicit own request lengths/prefixes/page rows are required",
-    )
-    requests = len(query_lengths)
-    _require_schedule(
-        all(type(row) is list and row for row in block_table)
-        and (not requests or len({len(row) for row in block_table}) == 1),
-        "A rectangular nonempty own block table is required",
-    )
-    starts, seq_lens, positions, flat_slots, slots, indices, logical = [0], [], [], [], [], [], []
-    allocated = set()
-    for query_len, prefix, pages in zip(query_lengths, prefix_lengths, block_table, strict=True):
-        _schedule_integer(query_len, minimum=1)
-        _schedule_integer(prefix)
-        end = _schedule_integer(prefix + query_len, minimum=1)
-        required_pages = (end + WINDOW_PAGE_ROWS - 1) // WINDOW_PAGE_ROWS
-        _require_schedule(required_pages <= len(pages), "Own cache pages must cover the complete sequence")
-        _require_schedule(
-            all(type(page) is int and -1 <= page < cache_blocks for page in pages),
-            "Own page IDs must be valid physical pages or unused -1 padding",
-        )
-        first_page = max(0, prefix - WINDOW_SIZE + 1) // WINDOW_PAGE_ROWS if rolling_pages else 0
-        used = pages[first_page:required_pages]
-        _require_schedule(
-            all(page >= 0 for page in used)
-            and len(set(used)) == len(used)
-            and not allocated.intersection(used),
-            "Live own request pages must be distinct",
-        )
-        allocated.update(used)
-
-        def physical(position, current_pages=pages):
-            return (
-                current_pages[position // WINDOW_PAGE_ROWS] * WINDOW_PAGE_ROWS + position % WINDOW_PAGE_ROWS
-            )
-
-        for position in range(prefix, end):
-            address = physical(position)
-            visible = list(range(max(0, position - WINDOW_SIZE + 1), position + 1))
-            padding = [-1] * (WINDOW_SIZE - len(visible))
-            positions.append(position)
-            flat_slots.append(address)
-            slots.append([address // WINDOW_PAGE_ROWS, address % WINDOW_PAGE_ROWS])
-            logical.append(visible + padding)
-            indices.append([physical(token) for token in visible] + padding)
-        starts.append(starts[-1] + query_len)
-        seq_lens.append(end)
-    _require_schedule(
-        starts[-1] <= capacity and len(set(flat_slots)) == len(flat_slots),
-        "Own active rows must fit capacity with unique cache publications",
-    )
-    return dict(
-        active=starts[-1],
-        capacity=capacity,
-        cache_blocks=cache_blocks,
-        num_reqs=requests,
-        query_lengths=list(query_lengths),
-        prefix_lengths=list(prefix_lengths),
-        query_start_loc=starts,
-        seq_lens=seq_lens,
-        block_table=[list(row) for row in block_table],
-        positions=positions,
-        flat_slot_mapping=flat_slots,
-        slot_mapping=slots,
-        physical_window_indices=indices,
-        logical_window_indices=logical,
-        max_query_len=max(query_lengths, default=0),
-        max_seq_len=max(seq_lens, default=0),
-        cache_shape=[cache_blocks, WINDOW_PAGE_ROWS, 1, WINDOW_HEAD_DIM],
-        cache_dtype="BF16",
-        heads=WINDOW_HEADS,
-        head_dim=WINDOW_HEAD_DIM,
-        sliding_window=WINDOW_SIZE,
-        cmp_ratio=0,
-        causal=True,
-        ori_mask_mode=4,
-        cmp_mask_mode=0,
-        ori_win_left=127,
-        ori_win_right=0,
-        ori_topk=0,
-        cmp_topk=0,
-        layout_q="TND",
-        layout_kv="PA_BBND",
-        topk_value_mode=1,
-        return_softmax_lse=False,
-    )
-
-
-def window_schedule_from_controls(starts, seq_lens, block_table, *, cache_blocks, capacity,
-                                  rolling_pages=False):
-    _require_schedule(
-        type(starts) is list
-        and len(starts) >= 1
-        and starts[0] == 0
-        and type(starts[0]) is int
-        and type(seq_lens) is list
-        and len(seq_lens) == len(starts) - 1,
-        "Own cumulative query starts must partition requests",
-    )
-    for value in starts:
-        _schedule_integer(value)
-    for value in seq_lens:
-        _schedule_integer(value, minimum=1)
-    lengths = [right - left for left, right in zip(starts[:-1], starts[1:], strict=True)]
-    prefixes = [end - count for end, count in zip(seq_lens, lengths, strict=True)]
-    return build_window_schedule(lengths, prefixes, block_table, cache_blocks=cache_blocks, capacity=capacity,
-                                 rolling_pages=rolling_pages)
+def prepare_decode_inputs(values):
+    """Lower one TP member's current prefill metadata to the decode input contract."""
+    embedding = values["embedding"].float()
+    result = {
+        "x_hc": embedding[:, None, :].expand(-1, M.hc_mult, -1).contiguous(),
+        "pre_mix": values["initial_pre"], "engram_lookup": values["engram_lookup"],
+        "logit_row_indices": values["logit_rows"],
+    }
+    # Prefill metadata has encoder/decoder stages; decode starts from encoder rows.
+    for name in ("window_slots", "window_indices", "token_to_req_indices", "position_ids", "query_start_loc"):
+        result[name] = values[name][0].contiguous()
+    for name in ("freqs_cos", "freqs_sin", "c2a_compressed_slots", "c1a_compressed_slots",
+                 "c2a_index_block_table", "c1a_index_block_table", "state_block_table"):
+        result[name] = values[name]
+    return result

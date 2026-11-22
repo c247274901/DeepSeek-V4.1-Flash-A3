@@ -6,1377 +6,471 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Checkpoint readers, phase weight layouts and resident operand ownership."""
+"""W8A8 checkpoint reading and TP4/EP16 resident weight sharding."""
 
-import argparse
+import sys
+from pathlib import Path
+
+if not __package__:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    __package__ = "models.deepseek_v4_1_flash_a3"
+
 import hashlib
 import json
 import math
-import re
 import struct
-from collections import Counter, deque
-from collections.abc import Iterator as decode_Iterator
-from concurrent.futures import ThreadPoolExecutor
-from contextlib import ExitStack, contextmanager, nullcontext
-from pathlib import Path
-from time import perf_counter
-from typing import Any, Iterator, Mapping
+
 import torch
-from .cache import resolve_layer_role
-from .config import FLASH
-from .gemm import prepare_ecotech_dynamic_weight
-from .runtime_config import ExpertParallelConfig
-from .utils import BLOCKED_INT8_COLUMNS, pack_blocked_weight, pack_nz
+
+from .config import FLASH as M, EP_SIZE, N_LOCAL_EXPERTS, TP_SIZE, WEIGHT_LAYOUT_VERSION
+
+ENGRAM_K = (M.engram_max_ngram_size - 1) * M.engram_n_heads * M.engram_head_dim
+KV_OUT = (M.hc_mult + 1) * M.hidden_size
+_DTYPES = {"F32": torch.float32, "BF16": torch.bfloat16, "I8": torch.int8}
 
 
-_DTYPES = {
-    "I8": torch.int8,
-    "U8": torch.uint8,
-    "I32": torch.int32,
-    "F16": torch.float16,
-    "BF16": torch.bfloat16,
-    "F32": torch.float32,
-}
-
-ROUTED_PACK_WORKERS = 4
-
-
-def _shape(value: Any) -> tuple[int, ...]:
-    if isinstance(value, str):
-        value = json.loads(value)
-    if not isinstance(value, (list, tuple)):
-        raise TypeError(f"metadata shape must be a list, got {type(value).__name__}")
-    result = tuple(int(dim) for dim in value)
-    if any(dim < 0 for dim in result):
-        raise ValueError(f"metadata shape contains a negative dimension: {result}")
-    return result
-
-
-class RawCheckpoint:
-    """Read complete tensors from a raw checkpoint without copying by default."""
+class Checkpoint:
+    """Read requested original checkpoint tensors and selected embedding rows."""
 
     def __init__(self, root: str | Path):
-        self.root = Path(root).expanduser().resolve()
-        if not self.root.is_dir():
-            raise FileNotFoundError(f"checkpoint directory does not exist: {self.root}")
-        self._metadata: dict[str, dict[str, Any]] = {}
-
-    def _base_name(self, name: str) -> str:
-        clean = name.removesuffix(".bin").removesuffix(".bin.json")
-        if not clean:
-            raise ValueError("checkpoint tensor name is empty")
-        return clean
-
-    def metadata(self, name: str) -> dict[str, Any]:
-        base = self._base_name(name)
-        if base not in self._metadata:
-            metadata_path = self.root / f"{base}.bin.json"
-            if not metadata_path.is_file():
-                raise FileNotFoundError(f"checkpoint metadata is missing: {metadata_path}")
-            payload = json.loads(metadata_path.read_text())
-            if not isinstance(payload, dict):
-                raise TypeError(f"checkpoint metadata must be an object: {metadata_path}")
-            self._metadata[base] = payload
-        return self._metadata[base]
-
-    def tensor(self, name: str, *, clone: bool = False) -> torch.Tensor:
-        base = self._base_name(name)
-        metadata = self.metadata(base)
-        if metadata.get("outcome") not in (None, "complete"):
-            raise ValueError(f"checkpoint tensor is not complete: {base} ({metadata.get('outcome')})")
-        dtype_name = str(metadata.get("dtype", "")).upper()
-        if dtype_name not in _DTYPES:
-            raise TypeError(f"unsupported checkpoint dtype for {base}: {dtype_name!r}")
-        dtype = _DTYPES[dtype_name]
-        shape = _shape(metadata.get("shape"))
-        numel = 1
-        for dim in shape:
-            numel *= dim
-        path = self.root / f"{base}.bin"
-        if not path.is_file():
-            raise FileNotFoundError(f"checkpoint tensor is missing: {path}")
-        expected_bytes = numel * torch.empty((), dtype=dtype).element_size()
-        actual_bytes = path.stat().st_size
-        if actual_bytes < expected_bytes:
-            raise ValueError(f"{base} is truncated: {actual_bytes} < {expected_bytes} bytes")
-        declared_bytes = metadata.get("bytes")
-        if declared_bytes is not None and int(declared_bytes) != expected_bytes:
-            raise ValueError(
-                f"{base} metadata bytes do not match shape/dtype: {declared_bytes} != {expected_bytes}"
-            )
-        value = torch.from_file(str(path), shared=False, size=numel, dtype=dtype).reshape(shape)
-        return value.clone() if clone else value
-
-    def require(self, names: list[str]) -> dict[str, torch.Tensor]:
-        return {name: self.tensor(name) for name in names}
-
-
-def flatten_scale(value: torch.Tensor, name: str) -> torch.Tensor:
-    """Normalize a checkpoint ``[N, 1]`` channel scale to ``[N]``."""
-
-    if value.ndim == 2 and value.shape[1] == 1:
-        value = value[:, 0]
-    if value.ndim != 1:
-        raise ValueError(f"{name} must be a vector or [N, 1], got {tuple(value.shape)}")
-    return value
-
-
-def load_attention_weights(checkpoint: RawCheckpoint, layer: int) -> dict[str, torch.Tensor]:
-    """Load A2/A3 attention tensors for any migrated decoder layer.
-
-    Entries ending in ``_raw`` retain checkpoint output-major layout.  Entries
-    ending in ``_canonical`` retain logical ``[K, N]`` for reference use;
-    ``_packed`` entries are the blocked operands consumed by W8A8 helpers.
-    """
-
-    if layer < 0:
-        raise ValueError("layer must be non-negative")
-    prefix = f"layers.{layer}.attn"
-    names = [
-        f"{prefix}.wq_a.weight",
-        f"{prefix}.wq_a.weight_scale",
-        f"{prefix}.wq_a.weight_offset",
-        f"{prefix}.wq_b.weight",
-        f"{prefix}.wq_b.weight_scale",
-        f"{prefix}.wq_b.weight_offset",
-        f"{prefix}.wkv.weight",
-        f"{prefix}.wkv.weight_scale",
-        f"{prefix}.wkv.weight_offset",
-        f"{prefix}.q_norm.weight",
-        f"{prefix}.kv_norm.weight",
-        f"{prefix}.wo_a.weight",
-        f"{prefix}.wo_b.weight",
-        f"{prefix}.attn_sink",
-    ]
-    optional_names = [
-        f"{prefix}.compressor.wkv.weight",
-        f"{prefix}.compressor.wgate.weight",
-        f"{prefix}.compressor.norm.weight",
-        f"{prefix}.indexer.wk.weight",
-        f"{prefix}.indexer.k_norm.weight",
-        f"{prefix}.indexer.wq_b.weight",
-        f"{prefix}.indexer.wq_b.weight_scale",
-        f"{prefix}.indexer.wq_b.weight_offset",
-        f"{prefix}.indexer.weights_proj.weight",
-    ]
-    names.extend(name for name in optional_names if (checkpoint.root / f"{name}.bin.json").is_file())
-    raw = checkpoint.require(names)
-    result: dict[str, torch.Tensor] = dict(raw)
-    for name in ("wq_a", "wq_b", "wkv"):
-        result[f"{name}_canonical"] = raw[f"{prefix}.{name}.weight"].transpose(0, 1).contiguous()
-        result[f"{name}_packed"] = pack_blocked_weight(result[f"{name}_canonical"])
-        result[f"{name}_scale"] = flatten_scale(
-            raw[f"{prefix}.{name}.weight_scale"], f"{prefix}.{name}.weight_scale"
-        )
-    result["q_norm"] = raw[f"{prefix}.q_norm.weight"]
-    result["kv_norm"] = raw[f"{prefix}.kv_norm.weight"]
-    result["wo_a_raw"] = raw[f"{prefix}.wo_a.weight"]
-    result["wo_b_raw"] = raw[f"{prefix}.wo_b.weight"]
-    result["attn_sink"] = raw[f"{prefix}.attn_sink"]
-    # The vLLM A2/A3 W8A8 path is symmetric.  Keep this check next to the
-    # conversion so a per-channel asymmetric checkpoint cannot silently be
-    # interpreted as a different operator ABI.
-    for name in ("wq_a", "wq_b", "wkv"):
-        offset = flatten_scale(raw[f"{prefix}.{name}.weight_offset"], f"{prefix}.{name}.weight_offset")
-        if not torch.equal(offset, torch.zeros_like(offset)):
-            raise ValueError(
-                f"{prefix}.{name} has non-zero weight offsets; A2/A3 W8A8 requires symmetric weights"
-            )
-        result[f"{name}_offset"] = offset
-
-    # Wo-A is stored output-major as [groups * rank, group_input], while the
-    # A2/A3 grouped kernel consumes [groups, group_input, rank].  Wo-B is
-    # stored [hidden, groups * rank] and is transposed to [K, N].
-    wo_a = raw[f"{prefix}.wo_a.weight"]
-    wo_b = raw[f"{prefix}.wo_b.weight"]
-    if wo_a.ndim != 2 or wo_b.ndim != 2:
-        raise ValueError(f"{prefix} output projections must be matrices")
-    if wo_a.shape[0] % 8:
-        raise ValueError(f"{prefix}.wo_a first dimension must be divisible by 8")
-    groups = 8
-    rank = wo_a.shape[0] // groups
-    result["wo_a"] = wo_a.reshape(groups, rank, wo_a.shape[1]).transpose(1, 2).contiguous()
-    result["wo_b"] = wo_b.transpose(0, 1).contiguous()
-
-    # The source layers carry the ratio-2 compressor/indexer tensors.  The
-    # ratio-1 source (L20) uses the same names but only has compressor.wkv.
-    compressor_wkv_name = f"{prefix}.compressor.wkv.weight"
-    if compressor_wkv_name in raw:
-        result["compressor_wkv"] = raw[compressor_wkv_name]
-        result["compressor_wkv_canonical"] = raw[compressor_wkv_name].transpose(0, 1).contiguous()
-        result["compressor_norm"] = raw[f"{prefix}.compressor.norm.weight"]
-    index_prefix = f"{prefix}.indexer"
-    if (checkpoint.root / f"{index_prefix}.wk.weight.bin.json").is_file():
-        result["index_wk"] = raw[f"{index_prefix}.wk.weight"].transpose(0, 1).contiguous()
-        result["index_k_norm"] = raw[f"{index_prefix}.k_norm.weight"]
-    if (checkpoint.root / f"{index_prefix}.weights_proj.weight.bin.json").is_file():
-        result["index_weights_proj"] = raw[f"{index_prefix}.weights_proj.weight"].transpose(0, 1).contiguous()
-    if (checkpoint.root / f"{index_prefix}.wq_b.weight.bin.json").is_file():
-        result["index_wq_b"] = raw[f"{index_prefix}.wq_b.weight"].transpose(0, 1).contiguous()
-        result["index_wq_b_scale"] = flatten_scale(
-            raw[f"{index_prefix}.wq_b.weight_scale"], f"{index_prefix}.wq_b.weight_scale"
-        )
-        index_offset = flatten_scale(
-            raw[f"{index_prefix}.wq_b.weight_offset"], f"{index_prefix}.wq_b.weight_offset"
-        )
-        if not torch.equal(index_offset, torch.zeros_like(index_offset)):
-            raise ValueError(f"{index_prefix}.wq_b has non-zero weight offsets")
-
-    if f"{prefix}.compressor.wgate.weight" in raw:
-        result["compressor_wgate"] = raw[f"{prefix}.compressor.wgate.weight"]
-        result["compressor_wgate_canonical"] = (
-            raw[f"{prefix}.compressor.wgate.weight"].transpose(0, 1).contiguous()
-        )
-    if "index_wk" in result:
-        result["index_wk_raw"] = raw[f"{prefix}.indexer.wk.weight"]
-        result["index_wk_canonical"] = result["index_wk"]
-        result["index_wq_b_canonical"] = result["index_wq_b"]
-        result["index_weights_proj_raw"] = raw[f"{prefix}.indexer.weights_proj.weight"]
-    # Keep the original raw tensors for callers that need to inspect the
-    # checkpoint layout, while exposing canonical tensors for A2/A3 kernels.
-    result["wo_a_raw"] = wo_a
-    result["wo_b_raw"] = wo_b
-    return result
-
-
-load_decoder_layer_weights = load_attention_weights
-
-
-class CheckpointOperands:
-    """Read original sharded safetensors and record each consumed operand."""
-
-    def __init__(self, root):
-        import json
-
         self.root = Path(root).resolve()
-        index = self.root / "quant_model_weights.safetensors.index.json"
-        self.index = json.loads(index.read_text())["weight_map"]
-        self.consumed = {}
-        self.read_seconds, self.read_calls = 0.0, 0
-
-    def _source(self, path):
-        from safetensors import safe_open
-
-        return safe_open(path, framework="pt", device="cpu")
-
-    def load(self, name):
-        """Load complete logical checkpoint bytes before any layout or dtype conversion."""
-        begin = perf_counter()
-        path = self.root / self.index[name]
-        with self._source(path) as source:
-            value = source.get_tensor(name)
-        self.consumed[name] = {
-            "file": path.name,
-            "shape": list(value.shape),
-            "dtype": str(value.dtype),
-            "selected_rows": None,
+        config = json.loads((self.root / "config.json").read_text())
+        text = config["text_config"]
+        quant = config.get("quantization_config", {})
+        if quant.get("quant_method") != "ascend" or quant.get("model_quant_type") != "W8A8_DYNAMIC":
+            raise ValueError("checkpoint must use symmetric W8A8_DYNAMIC quantization")
+        required = {
+            "hidden_size": M.hidden_size,
+            "num_hidden_layers": M.num_hidden_layers,
+            "num_attention_heads": M.num_attention_heads,
+            "head_dim": M.head_dim,
+            "sliding_window": M.sliding_window,
+            "kv_source_layer_ids": list(M.kv_source_layer_ids),
+            "index_source_layer_ids": list(M.index_source_layer_ids),
+            "engram_layer_ids": list(M.engram_layer_ids),
+            "engram_num_embeddings": list(M.engram_num_embeddings),
+            "engram_max_ngram_size": M.engram_max_ngram_size,
+            "engram_n_heads": M.engram_n_heads,
+            "engram_head_dim": M.engram_head_dim,
+            "engram_compressed_vocab_size": M.engram_compressed_vocab_size,
+            "engram_vocab_size": M.engram_vocab_size,
+            "engram_pad_token_id": M.engram_pad_token_id,
         }
-        self.read_seconds += perf_counter() - begin
-        self.read_calls += 1
-        return value
+        for name, expected in required.items():
+            if text.get(name) != expected:
+                raise ValueError(f"checkpoint {name}={text.get(name)!r}, expected {expected!r}")
+        index = json.loads((self.root / "quant_model_weights.safetensors.index.json").read_text())
+        self.weight_map = index["weight_map"].copy()
+        expected_rotation = {"value_projection_rotated": True, "value_basis": "quarot_global",
+                             "key_and_gate_basis": "original", "runtime_delta_rotation": False}
+        if config.get("engram_rotation_config") != expected_rotation:
+            raise ValueError("unsupported Engram key/value basis contract")
+        description = json.loads((self.root / "quant_model_description.json").read_text())
+        rotation = description["optional"]["quarot"]["rotation_map"]["global_rotation"]
+        if rotation != "optional/quarot.safetensors":
+            raise ValueError("unsupported global rotation payload location")
+        self.weight_map["global_rotation"] = rotation
+        self._headers = {}
+        self._row_tables = {}
 
-    def read_expert(self, prefix):
-        """Read one expert's original payloads, scales and symmetric offsets."""
-        operands = {}
-        for stem in ("w1", "w2", "w3"):
-            for suffix in ("weight", "weight_scale", "weight_offset"):
-                operands[stem + "." + suffix] = self.load(prefix + "." + stem + "." + suffix)
-            if torch.count_nonzero(operands[stem + ".weight_offset"]):
-                raise ValueError("W8A8 expert operands must have symmetric zero offsets")
-        return operands
+    def tensor(self, name: str) -> torch.Tensor:
+        """Return an owned CPU tensor without loading the rest of its shard."""
+        shard = self.weight_map[name]
+        path = (self.root / shard).resolve()
+        if not path.is_relative_to(self.root):
+            raise ValueError(f"checkpoint shard leaves its root: {shard}")
+        with path.open("rb") as file:
+            header_size = struct.unpack("<Q", file.read(8))[0]
+            if header_size > 64 * 1024 * 1024:
+                raise ValueError(f"safetensors header is too large: {shard}")
+            if shard not in self._headers:
+                self._headers[shard] = json.loads(file.read(header_size))
+            entry = self._headers[shard][name]
+            dtype = _DTYPES[entry["dtype"]]
+            shape = entry["shape"]
+            start, end = entry["data_offsets"]
+            expected_bytes = math.prod(shape) * torch.empty((), dtype=dtype).element_size()
+            if start < 0 or end - start != expected_bytes or 8 + header_size + end > path.stat().st_size:
+                raise ValueError(f"invalid safetensors range for {name}")
+            file.seek(8 + header_size + start)
+            payload = bytearray(file.read(expected_bytes))
+        if len(payload) != expected_bytes:
+            raise ValueError(f"truncated safetensors payload for {name}")
+        return torch.frombuffer(payload, dtype=dtype).reshape(shape)
 
-    def expert(self, prefix, *, partitions=1):
-        """Pack gate/up and down once while retaining the true channel scales."""
-        operands = self.read_expert(prefix)
-        w1, w3 = operands["w1.weight"], operands["w3.weight"]
-        gate_up = torch.cat((w1, w3), dim=0).transpose(0, 1).contiguous()
-        gate_scale = torch.cat((operands["w1.weight_scale"], operands["w3.weight_scale"])).flatten().float()
-        down = operands["w2.weight"].transpose(0, 1).contiguous()
-        down_scale = operands["w2.weight_scale"].flatten().float()
-        if gate_up.dtype != torch.int8 or down.dtype != torch.int8:
-            raise TypeError("Expert checkpoint weights must remain INT8")
-        if partitions != 1:
-            if partitions not in (2, 4) or w1.shape[0] % partitions:
-                raise ValueError("Expert partitions must divide the checkpoint intermediate width")
-            width = w1.shape[0] // partitions
-            padded = (width + 255) // 256 * 256
-            gates, scales, downs = [], [], []
-            for peer in range(partitions):
-                begin, end = peer * width, (peer + 1) * width
-                local_gate = torch.zeros((gate_up.shape[0], 2 * padded), dtype=torch.int8)
-                local_gate[:, :width] = gate_up[:, begin:end]
-                local_gate[:, padded:padded + width] = gate_up[:, w1.shape[0] + begin:w1.shape[0] + end]
-                local_scale = torch.zeros(2 * padded, dtype=torch.float32)
-                local_scale[:width] = gate_scale[begin:end]
-                local_scale[padded:padded + width] = gate_scale[w1.shape[0] + begin:w1.shape[0] + end]
-                local_down = torch.zeros((padded, down.shape[1]), dtype=torch.int8)
-                local_down[:width] = down[begin:end]
-                gates.append(pack_blocked_weight(local_gate))
-                scales.append(local_scale)
-                downs.append(pack_blocked_weight(local_down))
-            return torch.cat(gates), torch.cat(scales), torch.cat(downs), down_scale
-        return pack_blocked_weight(gate_up), gate_scale, pack_blocked_weight(down), down_scale
-
-
-def load_tensor_bundle(
-    path: str | Path, required: Mapping[str, tuple[torch.dtype, tuple[int, ...]]] | None = None
-):
-    """Load a ``torch.save`` bundle and validate the A2/A3 tensor contract.
-
-    The prepared layer-0 and layer-2 assets under the checkpoint workspace are
-    already converted to contiguous ``[K, N]`` INT8 weights with FP32 channel
-    scales.  This loader deliberately refuses silent dtype or shape changes.
-    """
-
-    bundle_path = Path(path)
-    payload = torch.load(bundle_path, map_location="cpu", weights_only=False)
-    if not isinstance(payload, dict):
-        raise TypeError(f"expected a tensor dictionary in {bundle_path}, got {type(payload).__name__}")
-    if not all(isinstance(key, str) and isinstance(value, torch.Tensor) for key, value in payload.items()):
-        raise TypeError(f"all entries in {bundle_path} must be named torch.Tensor values")
-    if required is not None:
-        missing = sorted(set(required) - set(payload))
-        if missing:
-            raise KeyError(f"missing tensors in {bundle_path}: {missing}")
-        for name, (dtype, shape) in required.items():
-            tensor = payload[name]
-            if tensor.dtype != dtype or tuple(tensor.shape) != tuple(shape):
-                raise ValueError(
-                    f"{name} contract mismatch: got dtype={tensor.dtype}, shape={tuple(tensor.shape)}; "
-                    f"expected dtype={dtype}, shape={shape}"
-                )
-    return payload
-
-
-def load_layer0_qkv(path: str | Path):
-    """Load a logical layer-0 QKV bundle and pack its fixed INT8 operands."""
-
-    bundle = load_tensor_bundle(
-        path,
-        {
-            "wq_a": (torch.int8, (5120, 1280)),
-            "wq_a_scale": (torch.float32, (1280,)),
-            "wq_b": (torch.int8, (1280, 32768)),
-            "wq_b_scale": (torch.float32, (32768,)),
-            "wkv": (torch.int8, (5120, 512)),
-            "wkv_scale": (torch.float32, (512,)),
-            "q_norm_weight": (torch.bfloat16, (1280,)),
-            "kv_norm_weight": (torch.bfloat16, (512,)),
-        },
-    )
-    for name in ("wq_a", "wq_b", "wkv"):
-        bundle[name] = pack_blocked_weight(bundle[name])
-    return bundle
-
-
-def load_layer0_shared_expert(path: str | Path):
-    """Load a logical layer-0 shared expert bundle and pack its fixed weights."""
-
-    bundle = load_tensor_bundle(
-        path,
-        {
-            "gate_up_weight": (torch.int8, (5120, 4608)),
-            "gate_up_scale": (torch.float32, (4608,)),
-            "down_weight": (torch.int8, (2304, 5120)),
-            "down_scale": (torch.float32, (5120,)),
-        },
-    )
-    for name in ("gate_up_weight", "down_weight"):
-        bundle[name] = pack_blocked_weight(bundle[name])
-    return bundle
-
-
-def load_layer0_output(path: str | Path):
-    """Load the prepared layer-0 grouped output projection bundle."""
-
-    return load_tensor_bundle(
-        path,
-        {
-            "wo_a": (torch.bfloat16, (8, 4096, 1024)),
-            "wo_b": (torch.int8, (8192, 5120)),
-            "wo_b_scale": (torch.float32, (5120,)),
-        },
-    )
-
-
-def load_layer0_router(path: str | Path):
-    """Load router tensors from the converted layer-0 MoE safetensors."""
-
-    try:
-        from safetensors import safe_open
-    except ImportError as exc:  # pragma: no cover - only hit outside pto
-        raise RuntimeError("router safetensors require the safetensors package") from exc
-    required = {
-        "gate.weight": (torch.bfloat16, (384, 5120)),
-        "gate.bias": (torch.float32, (384,)),
-    }
-    with safe_open(str(path), framework="pt", device="cpu") as handle:
-        result = {}
-        for name, (dtype, shape) in required.items():
-            if name not in handle.keys():
-                raise KeyError(f"missing tensors in {path}: {name}")
-            tensor = handle.get_tensor(name)
-            if tensor.dtype != dtype or tuple(tensor.shape) != shape:
-                raise ValueError(
-                    f"{name} contract mismatch: got dtype={tensor.dtype}, shape={tuple(tensor.shape)}; "
-                    f"expected dtype={dtype}, shape={shape}"
-                )
-            result[name] = tensor
-        if "gate.bias_vl" in handle.keys():
-            vision_bias = handle.get_tensor("gate.bias_vl")
-            if vision_bias.dtype != torch.float32 or tuple(vision_bias.shape) != (384,):
-                raise ValueError(
-                    f"gate.bias_vl contract mismatch: got dtype={vision_bias.dtype}, "
-                    f"shape={tuple(vision_bias.shape)}; expected dtype={torch.float32}, shape=(384,)"
-                )
-            result["gate.bias_vl"] = vision_bias
-    return result
-
-
-@contextmanager
-def open_layer0_moe(path: str | Path):
-    """Open the converted layer-0 MoE and expose a lazy expert provider.
-
-    The routed checkpoint is about 13 GiB.  Keeping the ``safe_open`` handle
-    alive lets a validator load only the six tensors for experts selected by
-    the router while retaining the exact INT8/FP32 tensors used by A2/A3.
-    """
-
-    try:
-        from safetensors import safe_open
-    except ImportError as exc:  # pragma: no cover - only hit outside pto
-        raise RuntimeError("MoE safetensors require the safetensors package") from exc
-
-    with safe_open(str(path), framework="pt", device="cpu") as handle:
-        required_router = {
-            "gate.weight": (torch.bfloat16, (384, 5120)),
-            "gate.bias": (torch.float32, (384,)),
-        }
-        router = {}
-        for name, (dtype, shape) in required_router.items():
-            if name not in handle.keys():
-                raise KeyError(f"missing tensors in {path}: {name}")
-            tensor = handle.get_tensor(name)
-            if tensor.dtype != dtype or tuple(tensor.shape) != shape:
-                raise ValueError(
-                    f"{name} contract mismatch: got dtype={tensor.dtype}, shape={tuple(tensor.shape)}; "
-                    f"expected dtype={dtype}, shape={shape}"
-                )
-            router[name] = tensor
-        if "gate.bias_vl" in handle.keys():
-            vision_bias = handle.get_tensor("gate.bias_vl")
-            if vision_bias.dtype != torch.float32 or tuple(vision_bias.shape) != (384,):
-                raise ValueError("gate.bias_vl must be FP32[384]")
-            router["gate.bias_vl"] = vision_bias
-
-        def expert_provider(expert_id: int) -> dict[str, torch.Tensor]:
-            expert = int(expert_id)
-            if not 0 <= expert < 384:
-                raise IndexError(f"expert id must be in [0, 384), got {expert}")
-            names = {
-                "w1": f"experts.{expert}.w1.weight",
-                "w1_scale": f"experts.{expert}.w1.scale",
-                "w2": f"experts.{expert}.w2.weight",
-                "w2_scale": f"experts.{expert}.w2.scale",
-                "w3": f"experts.{expert}.w3.weight",
-                "w3_scale": f"experts.{expert}.w3.scale",
-            }
-            result = {}
-            expected = {
-                "w1": (torch.int8, (5120, 2304)),
-                "w1_scale": (torch.float32, (2304,)),
-                "w2": (torch.int8, (2304, 5120)),
-                "w2_scale": (torch.float32, (5120,)),
-                "w3": (torch.int8, (5120, 2304)),
-                "w3_scale": (torch.float32, (2304,)),
-            }
-            for key, name in names.items():
-                if name not in handle.keys():
-                    raise KeyError(f"missing tensors in {path}: {name}")
-                tensor = handle.get_tensor(name)
-                dtype, shape = expected[key]
-                if tensor.dtype != dtype or tuple(tensor.shape) != shape:
-                    raise ValueError(
-                        f"{name} contract mismatch: got dtype={tensor.dtype}, shape={tuple(tensor.shape)}; "
-                        f"expected dtype={dtype}, shape={shape}"
-                    )
-                result[key] = tensor
-            return result
-
-        yield router, expert_provider
-
-
-class DecodeSafetensorsCheckpoint:
-    """Resolve and lazily load tensors from an indexed Aurora export."""
-
-    INDEX_NAME = "quant_model_weights.safetensors.index.json"
-
-    def __init__(self, root: str | Path):
-        self.root = Path(root).expanduser().resolve()
-        if not self.root.is_dir():
-            raise FileNotFoundError(f"checkpoint directory does not exist: {self.root}")
-        index_path = self.root / self.INDEX_NAME
-        if not index_path.is_file():
-            raise FileNotFoundError(f"safetensors index is missing: {index_path}")
-        payload = json.loads(index_path.read_text(encoding="utf-8"))
-        weight_map = payload.get("weight_map")
-        if not isinstance(weight_map, dict) or not weight_map:
-            raise ValueError(f"safetensors index has no weight_map: {index_path}")
-        self.weight_map: dict[str, str] = {str(name): str(shard) for name, shard in weight_map.items()}
-        self.config = self._load_json("config.json")
-        self.quantization_description = self._load_json("quant_model_description.json")
-
-    def _load_json(self, name: str) -> dict[str, Any]:
-        path = self.root / name
-        if not path.is_file():
-            raise FileNotFoundError(f"checkpoint metadata is missing: {path}")
-        value = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(value, dict):
-            raise TypeError(f"checkpoint metadata must be an object: {path}")
-        return value
-
-    def has(self, name: str) -> bool:
-        return name in self.weight_map or (self.root / name).is_file()
-
-    def shard_for(self, name: str) -> Path:
-        try:
+    def tensor_rows(self, name: str, rows: torch.Tensor) -> torch.Tensor:
+        """Read selected table rows without loading the complete tensor."""
+        if rows.dtype not in (torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64):
+            raise ValueError("table row ids must have an integer dtype")
+        ids = rows.to(dtype=torch.int64, device="cpu").flatten()
+        if name not in self._row_tables:
             shard = self.weight_map[name]
-        except KeyError as exc:
-            raise KeyError(f"tensor is absent from the safetensors index: {name}") from exc
-        path = self.root / shard
-        if not path.is_file():
-            raise FileNotFoundError(f"indexed shard is missing: {path}")
-        return path
+            path = (self.root / shard).resolve()
+            if not path.is_relative_to(self.root):
+                raise ValueError(f"checkpoint shard leaves its root: {shard}")
+            with path.open("rb") as file:
+                header_size = struct.unpack("<Q", file.read(8))[0]
+                if header_size > 64 * 1024 * 1024:
+                    raise ValueError(f"safetensors header is too large: {shard}")
+                if shard not in self._headers:
+                    self._headers[shard] = json.loads(file.read(header_size))
+            entry = self._headers[shard][name]
+            dtype, shape = _DTYPES[entry["dtype"]], entry["shape"]
+            if len(shape) != 2:
+                raise ValueError(f"invalid table rows for {name}")
+            row_bytes = shape[1] * torch.empty((), dtype=dtype).element_size()
+            start, end = entry["data_offsets"]
+            file_bytes = path.stat().st_size
+            if start < 0 or end - start != shape[0] * row_bytes or 8 + header_size + end > file_bytes:
+                raise ValueError(f"invalid safetensors range for {name}")
+            data = torch.from_file(str(path), shared=False, size=file_bytes, dtype=torch.uint8)
+            table = data.narrow(0, 8 + header_size + start, end - start).reshape(shape[0], row_bytes)
+            self._row_tables[name] = (table, dtype, shape[1])
+        table, dtype, width = self._row_tables[name]
+        if bool(((ids < 0) | (ids >= table.shape[0])).any()):
+            raise ValueError(f"invalid table rows for {name}")
+        selected = table.index_select(0, ids)
+        return selected.view(dtype).reshape(*rows.shape, width)
 
-    @contextmanager
-    def open_tensor(self, name: str) -> Iterator[Any]:
-        """Yield one safetensors handle and the requested tensor name."""
+    def descriptor(self, name):
+        """Read shape and dtype metadata without materializing a tensor."""
+        shard = self.weight_map[name]
+        if shard not in self._headers:
+            with (self.root / shard).open("rb") as file:
+                size = struct.unpack("<Q", file.read(8))[0]
+                if size > 64 * 1024**2:
+                    raise ValueError("safetensors header exceeds 64 MiB")
+                self._headers[shard] = json.loads(file.read(size))
+        return self._headers[shard][name]
 
-        try:
-            from safetensors import safe_open
-        except ImportError as exc:  # pragma: no cover - environment dependent
-            raise RuntimeError("Aurora Decode weights require the safetensors package") from exc
-        path = self.shard_for(name)
-        with safe_open(str(path), framework="pt", device="cpu") as handle:
-            if name not in handle.keys():
-                raise KeyError(f"tensor {name!r} is not present in indexed shard {path}")
-            yield handle, name
+    def rotation_blocks(self):
+        """Read and validate the checkpoint's orthogonal 32-dimensional rotation blocks."""
+        relative = self.weight_map["global_rotation"]
+        path = self.root / relative
+        manifest = json.loads((self.root / "aurora_export_manifest.json").read_text())
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        if digest != manifest["files"][relative]["sha256"]:
+            raise ValueError("global rotation payload does not match the checkpoint manifest")
+        rotation = self.tensor("global_rotation")
+        if rotation.dtype != torch.float32 or rotation.shape != (M.hidden_size, M.hidden_size):
+            raise ValueError("global rotation must be a hidden-size FP32 square matrix")
+        count = M.hidden_size // 32
+        view = rotation.reshape(count, 32, count, 32).permute(0, 2, 1, 3)
+        indices = torch.arange(count)
+        blocks = view[indices, indices].contiguous()
+        if int(torch.count_nonzero(rotation)) != int(torch.count_nonzero(blocks)):
+            raise ValueError("A3 requires the checkpoint's block-diagonal 32-dimensional global rotation")
+        gram = blocks @ blocks.transpose(-1, -2)
+        if not bool(torch.isfinite(blocks).all()) or not torch.allclose(gram, torch.eye(32), atol=1e-6, rtol=0):
+            raise ValueError("checkpoint global rotation blocks are not orthogonal")
+        return blocks
 
-    def tensor(self, name: str) -> Any:
-        """Load one host tensor; no tensor is retained by this reader."""
-
-        with self.open_tensor(name) as (handle, tensor_name):
-            return handle.get_tensor(tensor_name)
-
-    def require(self, names: list[str] | tuple[str, ...]) -> dict[str, Any]:
-        return {name: self.tensor(name) for name in names}
-
-    def layer_tensor_names(self, layer: int) -> tuple[str, ...]:
-        if layer < 0:
-            raise ValueError("layer must be non-negative")
-        prefix = f"layers.{layer}."
-        return tuple(sorted(name for name in self.weight_map if name.startswith(prefix)))
-
-    def layer_shards(self, layer: int) -> tuple[Path, ...]:
-        return tuple(sorted({self.shard_for(name) for name in self.layer_tensor_names(layer)}))
-
-    def engram_tensor(self, layer: int, kind: str) -> Any:
-        if layer not in (1, 14):
-            raise ValueError("Aurora Engram tables are defined for layers 1 and 14")
-        if kind not in ("weight", "scale"):
-            raise ValueError("Engram kind must be 'weight' or 'scale'")
-        path = self.root / f"engram_embed_{kind}_l{layer}.safetensors"
-        if not path.is_file():
-            raise FileNotFoundError(f"Engram tensor file is missing: {path}")
-        try:
-            from safetensors import safe_open
-        except ImportError as exc:  # pragma: no cover - environment dependent
-            raise RuntimeError("Aurora Engram weights require the safetensors package") from exc
-        with safe_open(str(path), framework="pt", device="cpu") as handle:
-            names = list(handle.keys())
-            if len(names) != 1:
-                raise ValueError(f"expected one tensor in {path}, found {names}")
-            return handle.get_tensor(names[0])
-
-
-HIDDEN = 5120
-INTERMEDIATE = 2304
-INTERMEDIATE_PADDED = 2560
-EXPERTS = 384
-DECODE_EP_SIZE = 16
-LOCAL_EXPERTS = EXPERTS // DECODE_EP_SIZE
-TOP_K = 6
-
-
-def _name(layer: int, suffix: str) -> str:
-    if layer < 0:
-        raise ValueError(f"layer must be non-negative, got {layer}")
-    return f"layers.{layer}.ffn.{suffix}"
+    @property
+    def identity(self):
+        names = ("config.json", "quant_model_weights.safetensors.index.json", "aurora_export_manifest.json",
+                 "quant_model_description.json", self.weight_map["global_rotation"])
+        return {name: hashlib.sha256((self.root / name).read_bytes()).hexdigest() for name in names}
 
 
-def _expert_name(layer: int, expert: int, suffix: str) -> str:
-    if not 0 <= expert < EXPERTS:
-        raise ValueError(f"expert must be in [0, {EXPERTS}), got {expert}")
-    return _name(layer, f"experts.{expert}.{suffix}")
-
-
-def _require(tensor: torch.Tensor, name: str, dtype: torch.dtype, shape: tuple[int, ...]) -> torch.Tensor:
-    if tensor.dtype != dtype or tuple(tensor.shape) != shape:
-        raise ValueError(
-            f"{name} contract mismatch: got dtype={tensor.dtype}, shape={tuple(tensor.shape)}; "
-            f"expected dtype={dtype}, shape={shape}"
-        )
-    return tensor.contiguous()
-
-
-def _require_zero_offset(tensor: torch.Tensor, name: str, shape: tuple[int, ...]) -> None:
-    offset = _require(tensor, name, torch.float32, shape)
-    if bool(torch.count_nonzero(offset).item()):
-        raise ValueError(
-            f"{name} contains non-zero affine offsets; the current PyPTO W8A8 ABI "
-            "supports the verified symmetric zero-offset export only"
-        )
-
-
-def _scale(tensor: torch.Tensor, name: str, channels: int) -> torch.Tensor:
-    value = _require(tensor, name, torch.float32, (channels, 1))
-    return value.reshape(channels).contiguous()
-
-
-def _pad_w2(weight: torch.Tensor, name: str) -> torch.Tensor:
-    logical = _require(weight, name, torch.int8, (HIDDEN, INTERMEDIATE))
-    padded = torch.zeros((HIDDEN, INTERMEDIATE_PADDED), dtype=torch.int8)
-    padded[:, :INTERMEDIATE].copy_(logical)
-    return padded
-
-
-def pack_routed_expert(
-    checkpoint: DecodeSafetensorsCheckpoint,
-    layer: int,
-    expert: int,
-) -> dict[str, torch.Tensor]:
-    """Load and pack one routed expert in the Decode FRACTAL_NZ layout.
-
-    W1/W3 are already in the kernel's logical ``[out, in]`` orientation.
-    W2 is also ``[hidden, intermediate]``; only its reduction tail is padded
-    from 2304 to 2560 for the A3 INT8 matmul tile contract.
-    """
-
-    w1 = _require(
-        checkpoint.tensor(_expert_name(layer, expert, "w1.weight")),
-        _expert_name(layer, expert, "w1.weight"),
-        torch.int8,
-        (INTERMEDIATE, HIDDEN),
-    )
-    w3 = _require(
-        checkpoint.tensor(_expert_name(layer, expert, "w3.weight")),
-        _expert_name(layer, expert, "w3.weight"),
-        torch.int8,
-        (INTERMEDIATE, HIDDEN),
-    )
-    w2_name = _expert_name(layer, expert, "w2.weight")
-    w2 = _pad_w2(checkpoint.tensor(w2_name), w2_name)
-
-    w1_scale_name = _expert_name(layer, expert, "w1.weight_scale")
-    w3_scale_name = _expert_name(layer, expert, "w3.weight_scale")
-    w2_scale_name = _expert_name(layer, expert, "w2.weight_scale")
-    w1_offset_name = _expert_name(layer, expert, "w1.weight_offset")
-    w3_offset_name = _expert_name(layer, expert, "w3.weight_offset")
-    w2_offset_name = _expert_name(layer, expert, "w2.weight_offset")
-    _require_zero_offset(checkpoint.tensor(w1_offset_name), w1_offset_name, (INTERMEDIATE, 1))
-    _require_zero_offset(checkpoint.tensor(w3_offset_name), w3_offset_name, (INTERMEDIATE, 1))
-    _require_zero_offset(checkpoint.tensor(w2_offset_name), w2_offset_name, (HIDDEN, 1))
-
-    return {
-        "w1": pack_nz(w1),
-        "w1_scale": _scale(checkpoint.tensor(w1_scale_name), w1_scale_name, INTERMEDIATE),
-        "w3": pack_nz(w3),
-        "w3_scale": _scale(checkpoint.tensor(w3_scale_name), w3_scale_name, INTERMEDIATE),
-        "w2": pack_nz(w2),
-        "w2_scale": _scale(checkpoint.tensor(w2_scale_name), w2_scale_name, HIDDEN),
+def forward_weight_layouts(local_experts=N_LOCAL_EXPERTS):
+    """Return the shared prefill/decode ABI for one A3 rank."""
+    if local_experts != 24:
+        raise ValueError("EP16 requires 24 complete experts per rank")
+    layers, d, inter = M.num_hidden_layers, M.hidden_size, M.moe_intermediate_size
+    heads, groups = M.num_attention_heads // TP_SIZE, M.o_groups // TP_SIZE
+    kv_sources, index_sources = len(M.kv_source_layer_ids), len(M.index_source_layer_ids)
+    c2a_sources = sum(M.compress_ratios[source] == 2 for source in M.kv_source_layer_ids)
+    result = {
+        "engram_wkv": ((2, ENGRAM_K, KV_OUT), torch.bfloat16),
+        "engram_weight": ((2, M.hc_mult, d), torch.float32),
+        "engram_rotation": ((d // 32, 32, 32), torch.float32),
+        "hc_attn_fn": ((layers * M.mix_hc, M.hc_dim), torch.float32),
+        "hc_attn_scale": ((layers * 3,), torch.float32),
+        "hc_attn_base": ((layers * M.mix_hc,), torch.float32),
+        "attn_norm_weight": ((layers * d,), torch.bfloat16),
+        "q_norm_weight": ((layers * M.q_lora_rank,), torch.bfloat16),
+        "kv_norm_weight": ((layers * M.head_dim,), torch.bfloat16),
+        "attn_sink": ((layers * heads,), torch.float32),
+        "wo_a": ((layers * groups, M.num_attention_heads * M.head_dim // M.o_groups, M.o_lora_rank), torch.bfloat16),
+        "wo_b": ((layers, groups * M.o_lora_rank, d), torch.bfloat16),
+        "c2a_compressor_wkv": ((c2a_sources, d, M.head_dim), torch.bfloat16),
+        "c2a_compressor_wgate": ((c2a_sources, d, M.head_dim), torch.bfloat16),
+        "c1a_compressor_wkv": ((d, M.head_dim), torch.bfloat16),
+        "compressor_norm_weight": ((kv_sources * M.head_dim,), torch.bfloat16),
+        "index_wk": ((index_sources, M.head_dim, M.index_head_dim), torch.bfloat16),
+        "index_norm_weight": ((index_sources * M.index_head_dim,), torch.bfloat16),
+        "index_weights_proj": ((index_sources, d, M.index_n_heads), torch.bfloat16),
+        "hc_ffn_fn": ((layers * M.mix_hc, M.hc_dim), torch.float32),
+        "hc_ffn_scale": ((layers * 3,), torch.float32),
+        "hc_ffn_base": ((layers * M.mix_hc,), torch.float32),
+        "ffn_norm_weight": ((layers * d,), torch.bfloat16),
+        "gate_weight": ((layers * M.n_routed_experts, d), torch.float32),
+        "correction_bias": ((layers * M.n_routed_experts,), torch.float32),
+        "final_norm_weight": ((d,), torch.bfloat16),
+        "lm_head_weight": ((M.vocab_size // TP_SIZE, d), torch.bfloat16),
     }
-
-
-def iter_routed_experts(
-    checkpoint: DecodeSafetensorsCheckpoint,
-    layer: int,
-    rank: int,
-) -> decode_Iterator[tuple[int, dict[str, torch.Tensor]]]:
-    """Yield one EP16 owner's experts without retaining a second full shard."""
-
-    if not 0 <= rank < DECODE_EP_SIZE:
-        raise ValueError(f"Decode rank must be in [0, {DECODE_EP_SIZE}), got {rank}")
-    first = rank * LOCAL_EXPERTS
-    for expert in range(first, first + LOCAL_EXPERTS):
-        yield expert, pack_routed_expert(checkpoint, layer, expert)
-
-
-def load_routed_shard(
-    checkpoint: DecodeSafetensorsCheckpoint,
-    layer: int,
-    rank: int,
-) -> dict[str, torch.Tensor]:
-    """Materialize one complete 24-expert EP16 shard in external NZ layout.
-
-    The ``pl.NZ`` annotation is logical in the Python signature, but the
-    distributed host ABI passes the compiler's physical five-dimensional
-    view.  The first dimension is the local expert, followed by
-    ``[C / C0, R / 16, 16, C0]``.  Keeping that shape here prevents the
-    validation runner from silently treating packed bytes as row-major data.
-    """
-
-    entries = [packed for _, packed in iter_routed_experts(checkpoint, layer, rank)]
-
-    def stack_nz(name: str, rows: int, cols: int) -> torch.Tensor:
-        value = torch.stack([entry[name] for entry in entries])
-        return value.reshape(LOCAL_EXPERTS, cols // 32, rows // 16, 16, 32).contiguous()
-
-    return {
-        "routed_w1": stack_nz("w1", INTERMEDIATE, HIDDEN),
-        "routed_w1_scale": torch.stack([entry["w1_scale"] for entry in entries]),
-        "routed_w3": stack_nz("w3", INTERMEDIATE, HIDDEN),
-        "routed_w3_scale": torch.stack([entry["w3_scale"] for entry in entries]),
-        "routed_w2": stack_nz("w2", HIDDEN, INTERMEDIATE_PADDED),
-        "routed_w2_scale": torch.stack([entry["w2_scale"] for entry in entries]),
+    projections = {
+        "wq_a": (layers, d, M.q_lora_rank),
+        "wq_b": (layers, M.q_lora_rank, heads * M.head_dim),
+        "wkv": (layers, d, M.head_dim),
+        "index_wq_b": (index_sources, M.q_lora_rank, M.index_n_heads * M.index_head_dim),
+        "shared_w1": (layers, d, inter),
+        "shared_w2": (layers, inter, d),
+        "shared_w3": (layers, d, inter),
+        "routed_w1": (layers * local_experts, d, inter),
+        "routed_w2": (layers * local_experts, inter, d),
+        "routed_w3": (layers * local_experts, d, inter),
     }
-
-
-def load_router(checkpoint: DecodeSafetensorsCheckpoint, layer: int) -> dict[str, torch.Tensor]:
-    """Load the replicated FP32 router operands for one physical layer."""
-
-    gate_name = _name(layer, "gate.weight")
-    text_name = _name(layer, "gate.bias")
-    vision_name = _name(layer, "gate.bias_vl")
-    gate = _require(checkpoint.tensor(gate_name), gate_name, torch.bfloat16, (EXPERTS, HIDDEN))
-    text = _require(checkpoint.tensor(text_name), text_name, torch.float32, (EXPERTS,))
-    vision = _require(checkpoint.tensor(vision_name), vision_name, torch.float32, (EXPERTS,))
-    return {
-        "gate_weight": gate.float().contiguous(),
-        "text_bias": text,
-        "vision_bias": vision,
-    }
-
-
-def load_shared_expert(checkpoint: DecodeSafetensorsCheckpoint, layer: int) -> dict[str, torch.Tensor]:
-    """Load shared W8A8 weights directly into the blocked GEMM operand ABI."""
-
-    w1_name = _name(layer, "shared_experts.w1.weight")
-    w3_name = _name(layer, "shared_experts.w3.weight")
-    w2_name = _name(layer, "shared_experts.w2.weight")
-    w1 = _require(checkpoint.tensor(w1_name), w1_name, torch.int8, (INTERMEDIATE, HIDDEN))
-    w3 = _require(checkpoint.tensor(w3_name), w3_name, torch.int8, (INTERMEDIATE, HIDDEN))
-    w2 = _require(checkpoint.tensor(w2_name), w2_name, torch.int8, (HIDDEN, INTERMEDIATE))
-    _require_zero_offset(
-        checkpoint.tensor(_name(layer, "shared_experts.w1.weight_offset")),
-        _name(layer, "shared_experts.w1.weight_offset"),
-        (INTERMEDIATE, 1),
-    )
-    _require_zero_offset(
-        checkpoint.tensor(_name(layer, "shared_experts.w3.weight_offset")),
-        _name(layer, "shared_experts.w3.weight_offset"),
-        (INTERMEDIATE, 1),
-    )
-    _require_zero_offset(
-        checkpoint.tensor(_name(layer, "shared_experts.w2.weight_offset")),
-        _name(layer, "shared_experts.w2.weight_offset"),
-        (HIDDEN, 1),
-    )
-    w1_scale_name = _name(layer, "shared_experts.w1.weight_scale")
-    w3_scale_name = _name(layer, "shared_experts.w3.weight_scale")
-    w2_scale_name = _name(layer, "shared_experts.w2.weight_scale")
-    return {
-        "shared_gate_up": pack_blocked_weight(torch.cat((w1.transpose(0, 1), w3.transpose(0, 1)), dim=1)),
-        "shared_gate_up_scale": torch.cat(
-            (
-                _scale(checkpoint.tensor(w1_scale_name), w1_scale_name, INTERMEDIATE),
-                _scale(checkpoint.tensor(w3_scale_name), w3_scale_name, INTERMEDIATE),
-            )
-        ).contiguous(),
-        "shared_down": pack_blocked_weight(w2.transpose(0, 1)),
-        "shared_down_scale": _scale(checkpoint.tensor(w2_scale_name), w2_scale_name, HIDDEN),
-    }
-
-
-def load_decode_rank_weights(
-    checkpoint: DecodeSafetensorsCheckpoint,
-    layer: int,
-    rank: int,
-) -> dict[str, torch.Tensor]:
-    """Load an EP16 MoE shard; attention and cache bindings are separate."""
-
-    result: dict[str, torch.Tensor] = {}
-    result.update(load_router(checkpoint, layer))
-    result.update(load_routed_shard(checkpoint, layer, rank))
-    result.update(load_shared_expert(checkpoint, layer))
+    for name, shape in projections.items():
+        bank_shape = (shape[0], shape[2], shape[1]) if name.startswith(("routed_", "shared_")) else shape
+        result[name] = (bank_shape, torch.int8)
+        result[name + "_scale"] = ((shape[0], shape[-1]), torch.float32)
     return result
 
 
-def abi_summary() -> dict[str, Any]:
-    """Return the fixed host-to-PyPTO layout without reading checkpoint data."""
+class ResidentWeights:
+    """Stream each checkpoint projection into persistent rank-local allocations."""
 
-    return {
-        "source": "Aurora safetensors W8A8_DYNAMIC",
-        "expert_parallel": DECODE_EP_SIZE,
-        "local_experts": LOCAL_EXPERTS,
-        "offset_policy": "reject_nonzero",
-        "routed": {
-            "w1_w3_logical": [INTERMEDIATE, HIDDEN],
-            "w1_w3_device": [LOCAL_EXPERTS, HIDDEN // 32, INTERMEDIATE // 16, 16, 32],
-            "w2_logical": [HIDDEN, INTERMEDIATE],
-            "w2_device": [LOCAL_EXPERTS, INTERMEDIATE_PADDED // 32, HIDDEN // 16, 16, 32],
-            "scale_w1_w3": [LOCAL_EXPERTS, INTERMEDIATE],
-            "scale_w2": [LOCAL_EXPERTS, HIDDEN],
-            "layout": "FRACTAL_NZ for all routed matrices; EP host shape flattens to [EP*LOCAL_EXPERTS, ...]",
-        },
-        "shared": {
-            "gate_up_logical": [HIDDEN, INTERMEDIATE * 2],
-            "down_logical": [INTERMEDIATE, HIDDEN],
-            "gate_up": [HIDDEN * (INTERMEDIATE * 2 // 64), 64],
-            "down": [INTERMEDIATE * (HIDDEN // 64), 64],
-            "layout": "blocked [N/64, K, 64] flattened to [K*(N/64), 64]; packed once by the loader",
-        },
-        "router": {"gate_weight": [EXPERTS, HIDDEN], "bias": [EXPERTS]},
-    }
-
-
-TARGET_LAYERS = (0, 1, 2, 3, 14, 15, 19, 20, 21, 24, 25)
-METADATA_FILES = (
-    "config.json",
-    "quant_model_weights.safetensors.index.json",
-    "quant_model_description.json",
-    "aurora_export_manifest.json",
-)
-SHARD_PATTERN = re.compile(r"quant_model_weights-(\d{5})-of-(\d{5})\.safetensors$")
-
-
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def _read_json(path: Path) -> Any:
-    return json.loads(path.read_text(encoding="utf-8"))
-
-
-def _safetensors_header(path: Path) -> tuple[int, str, dict[str, Any]]:
-    with path.open("rb") as stream:
-        raw_length = stream.read(8)
-        if len(raw_length) != 8:
-            raise ValueError(f"truncated safetensors length prefix: {path}")
-        header_length = struct.unpack("<Q", raw_length)[0]
-        header = stream.read(header_length)
-        if len(header) != header_length:
-            raise ValueError(f"truncated safetensors header: {path}")
-    try:
-        payload = json.loads(header)
-    except json.JSONDecodeError as exc:
-        raise ValueError(f"invalid safetensors header: {path}") from exc
-    if not isinstance(payload, dict):
-        raise TypeError(f"safetensors header must be an object: {path}")
-    return header_length, hashlib.sha256(raw_length + header).hexdigest(), payload
-
-
-def _config_summary(config: dict[str, Any]) -> dict[str, Any]:
-    text = config.get("text_config", {})
-    keys = (
-        "hidden_size",
-        "num_hidden_layers",
-        "num_attention_heads",
-        "num_key_value_heads",
-        "head_dim",
-        "q_lora_rank",
-        "o_lora_rank",
-        "n_routed_experts",
-        "n_shared_experts",
-        "num_experts_per_tok",
-        "moe_intermediate_size",
-        "compress_ratios",
-        "kv_source_layer_ids",
-        "index_source_layer_ids",
-        "index_n_heads",
-        "index_head_dim",
-        "index_topk",
-        "candidate_source_layer_id",
-        "engram_layer_ids",
-        "engram_num_embeddings",
-        "engram_n_heads",
-        "engram_head_dim",
+    layer_projections = (
+        ("hc_attn_fn", "hc_attn_fn"), ("hc_attn_scale", "hc_attn_scale"),
+        ("hc_attn_base", "hc_attn_base"), ("attn_norm_weight", "attn_norm.weight"),
+        ("q_norm_weight", "attn.q_norm.weight"), ("kv_norm_weight", "attn.kv_norm.weight"),
+        ("attn_sink", "attn.attn_sink"), ("hc_ffn_fn", "hc_ffn_fn"),
+        ("hc_ffn_scale", "hc_ffn_scale"), ("hc_ffn_base", "hc_ffn_base"),
+        ("ffn_norm_weight", "ffn_norm.weight"), ("gate_weight", "ffn.gate.weight"),
+        ("correction_bias", "ffn.gate.bias"),
     )
-    return {key: text.get(key) for key in keys}
-
-
-def inspect_checkpoint(root: str | Path) -> dict[str, Any]:
-    """Return a metadata and header manifest for one Aurora export."""
-
-    checkpoint_root = Path(root).expanduser().resolve()
-    if not checkpoint_root.is_dir():
-        raise FileNotFoundError(f"checkpoint directory does not exist: {checkpoint_root}")
-    missing = [name for name in METADATA_FILES if not (checkpoint_root / name).is_file()]
-    if missing:
-        raise FileNotFoundError(f"checkpoint metadata is missing: {', '.join(missing)}")
-
-    config = _read_json(checkpoint_root / "config.json")
-    index = _read_json(checkpoint_root / "quant_model_weights.safetensors.index.json")
-    description = _read_json(checkpoint_root / "quant_model_description.json")
-    weight_map = index.get("weight_map")
-    if not isinstance(weight_map, dict):
-        raise TypeError("safetensors index does not contain an object weight_map")
-
-    shard_paths: dict[str, Path] = {}
-    for path in sorted(checkpoint_root.glob("quant_model_weights-*-of-*.safetensors")):
-        match = SHARD_PATTERN.fullmatch(path.name)
-        if match:
-            shard_paths[path.name] = path
-    expected_shards = {
-        name for name in weight_map.values() if isinstance(name, str) and SHARD_PATTERN.fullmatch(name)
-    }
-    declared_totals = {int(SHARD_PATTERN.fullmatch(name).group(2)) for name in expected_shards}
-    if len(declared_totals) != 1:
-        raise ValueError(f"inconsistent shard totals in index: {sorted(declared_totals)}")
-    declared_shard_total = declared_totals.pop()
-    if not expected_shards:
-        raise ValueError("safetensors index contains no quantized weight shards")
-    missing_shards = sorted(expected_shards - shard_paths.keys())
-
-    headers: dict[str, dict[str, Any]] = {}
-    for name, path in shard_paths.items():
-        headers[name] = {
-            "bytes": path.stat().st_size,
-            "header_scanned": False,
-        }
-
-    target_layer_files: dict[str, list[str]] = {}
-    target_tensor_samples: dict[str, dict[str, Any]] = {}
-    scanned_headers: dict[str, dict[str, Any]] = {}
-    for layer in TARGET_LAYERS:
-        prefix = f"layers.{layer}."
-        names = sorted(name for name in weight_map if name.startswith(prefix))
-        files = {weight_map[name] for name in names}
-        target_layer_files[str(layer)] = sorted(files)
-        sample_names = [
-            name
-            for name in (
-                f"layers.{layer}.attn.wq_a.weight",
-                f"layers.{layer}.attn.wq_a.weight_scale",
-                f"layers.{layer}.attn.wq_b.weight",
-                f"layers.{layer}.attn.wkv.weight",
-                f"layers.{layer}.attn.wo_a.weight",
-                f"layers.{layer}.attn.wo_b.weight",
-                f"layers.{layer}.attn.indexer.wk.weight",
-                f"layers.{layer}.attn.indexer.wq_b.weight",
-                f"layers.{layer}.ffn.experts.0.w1.weight",
-            )
-            if name in weight_map
-        ]
-        samples: dict[str, Any] = {}
-        for name in sample_names:
-            shard = weight_map[name]
-            if shard not in scanned_headers:
-                header_bytes, header_sha256, header = _safetensors_header(checkpoint_root / shard)
-                tensors = {key: value for key, value in header.items() if key != "__metadata__"}
-                scanned_headers[shard] = header
-                headers[shard].update(
-                    {
-                        "header_bytes": header_bytes,
-                        "header_sha256": header_sha256,
-                        "tensor_count": len(tensors),
-                        "header_scanned": True,
-                    }
-                )
-            header = scanned_headers[shard]
-            tensor = header[name]
-            samples[name] = {
-                "shard": shard,
-                "dtype": tensor.get("dtype"),
-                "shape": tensor.get("shape"),
-            }
-        target_tensor_samples[str(layer)] = samples
-
-    quant_modes = Counter(value for value in description.values() if isinstance(value, str))
-    engram_files = sorted(
-        name
-        for name in (
-            "engram_embed_weight_l1.safetensors",
-            "engram_embed_scale_l1.safetensors",
-            "engram_embed_weight_l14.safetensors",
-            "engram_embed_scale_l14.safetensors",
-        )
-        if (checkpoint_root / name).is_file()
+    int8_projections = (
+        ("wq_a", "attn.wq_a"), ("wq_b", "attn.wq_b"), ("wkv", "attn.wkv"),
+        ("shared_w1", "ffn.shared_experts.w1"), ("shared_w2", "ffn.shared_experts.w2"),
+        ("shared_w3", "ffn.shared_experts.w3"),
     )
-    engram_records = []
-    for name in engram_files:
-        path = checkpoint_root / name
-        header_bytes, header_sha256, header = _safetensors_header(path)
-        engram_records.append(
-            {
-                "file": name,
-                "bytes": path.stat().st_size,
-                "header_bytes": header_bytes,
-                "header_sha256": header_sha256,
-                "tensors": {
-                    key: {"dtype": value.get("dtype"), "shape": value.get("shape")}
-                    for key, value in header.items()
-                    if key != "__metadata__"
-                },
-            }
-        )
-    return {
-        "schema_version": 1,
-        "status": "metadata_verified" if not missing_shards else "incomplete",
-        "root": str(checkpoint_root),
-        "payload_hashing": "omitted; safetensors payloads are immutable external assets",
-        "metadata": {
-            name: {
-                "bytes": (checkpoint_root / name).stat().st_size,
-                "sha256": _sha256(checkpoint_root / name),
-            }
-            for name in METADATA_FILES
-        },
-        "config": _config_summary(config),
-        "quantization": {
-            "config": config.get("quantization_config"),
-            "description_modes": dict(sorted(quant_modes.items())),
-        },
-        "index": {
-            "weight_map_entries": len(weight_map),
-            "total_size": index.get("metadata", {}).get("total_size"),
-            "weight_shards": len(expected_shards),
-            "declared_shard_total": declared_shard_total,
-            "present_shards": len(shard_paths),
-            "missing_shards": missing_shards,
-        },
-        "shards": headers,
-        "engram_files": engram_records,
-        "target_layer_files": target_layer_files,
-        "target_tensor_samples": target_tensor_samples,
-    }
+
+    def __init__(self, checkpoint, *, ep_size=EP_SIZE):
+        if (ep_size, TP_SIZE, N_LOCAL_EXPERTS) != (16, 4, 24):
+            raise ValueError("resident weights require DP4/TP4/EP16 and 24 local experts")
+        self.checkpoint = checkpoint
+        self.ranks = ep_size
+        self.local_experts = N_LOCAL_EXPERTS
+        self.tensor_layouts = forward_weight_layouts()
+
+    @property
+    def bytes_per_rank(self):
+        return sum(math.prod(shape) * torch.empty((), dtype=dtype).element_size()
+                   for shape, dtype in self.tensor_layouts.values())
+
+    @property
+    def byte_breakdown(self):
+        """Count named resident allocations with the checkpoint's INT8/FP32 scale ABI."""
+        result = {name: 0 for name in ("routed_experts", "shared_expert", "attention_tp", "lm_head", "replicated")}
+        for name, (shape, dtype) in self.tensor_layouts.items():
+            category = "replicated"
+            if name.startswith("routed_"):
+                category = "routed_experts"
+            elif name.startswith("shared_"):
+                category = "shared_expert"
+            elif name.startswith(("wq_b", "wo_a", "wo_b", "attn_sink")):
+                category = "attention_tp"
+            elif name == "lm_head_weight":
+                category = "lm_head"
+            result[category] += math.prod(shape) * torch.empty((), dtype=dtype).element_size()
+        return result
+
+    def projection(self, stem, *, output_slice=None, input_slice=None, output_major=False):
+        """Read a symmetric INT8 matrix and preserve the FP32 scale of each output channel."""
+        weight = self.checkpoint.tensor(stem + ".weight")
+        scale = self.checkpoint.tensor(stem + ".weight_scale")
+        offset = self.checkpoint.tensor(stem + ".weight_offset")
+        if weight.dtype != torch.int8 or weight.ndim != 2:
+            raise ValueError(f"expected an INT8 matrix: {stem}")
+        if scale.dtype != torch.float32 or scale.shape != (weight.shape[0], 1):
+            raise ValueError(f"expected per-output-channel FP32 scales: {stem}")
+        if offset.shape != scale.shape or bool(torch.count_nonzero(offset)):
+            raise ValueError(f"only symmetric zero-offset W8A8 is supported: {stem}")
+        if not bool(torch.isfinite(scale).all()) or bool((scale <= 0).any()):
+            raise ValueError(f"invalid quantization scales: {stem}")
+        if output_slice is not None:
+            weight, scale = weight[output_slice], scale[output_slice]
+        if input_slice is not None:
+            weight = weight[:, input_slice]
+        weight = weight.contiguous() if output_major else weight.t().contiguous()
+        return weight, scale.reshape(1, -1).contiguous()
+
+    def upload(self, runtime, rank, handles, *, layers=None):
+        """Upload each sharded payload and scale once to the selected worker."""
+        if rank not in range(self.ranks):
+            raise ValueError("rank must be in [0, 16)")
+        lane = rank % TP_SIZE
+        checkpoint = self.checkpoint
+
+        def copy(target, data, slot=0, slots=1):
+            shape, dtype = self.tensor_layouts[target]
+            elements = math.prod(shape) // slots
+            if data.dtype != dtype:
+                raise ValueError(f"checkpoint dtype mismatch for {target}: {data.dtype}, expected {dtype}")
+            data = data.contiguous()
+            if data.numel() != elements:
+                raise ValueError(f"checkpoint shape mismatch for {target}: {data.shape}, expected {elements} elements")
+            runtime.copy_to(handles[target].data_ptr, data.data_ptr(), data.numel() * data.element_size(),
+                            dst_offset=slot * elements * data.element_size(), worker_id=rank)
+
+        copy("engram_rotation", checkpoint.rotation_blocks())
+        total_layers = M.num_hidden_layers
+        selected_layers = range(total_layers) if layers is None else sorted(set(layers))
+        if any(layer not in range(total_layers) for layer in selected_layers):
+            raise ValueError("resident weight layers must be in [0, 40)")
+        heads, groups = M.num_attention_heads // TP_SIZE, M.o_groups // TP_SIZE
+        for layer in selected_layers:
+            for target, suffix in self.int8_projections:
+                output_slice = slice(lane * heads * M.head_dim, (lane + 1) * heads * M.head_dim) if target == "wq_b" else None
+                weight, scale = self.projection(f"layers.{layer}.{suffix}", output_slice=output_slice,
+                                                output_major=target.startswith("shared_"))
+                copy(target, weight, layer, total_layers)
+                copy(target + "_scale", scale, layer, total_layers)
+            for target, suffix in self.layer_projections:
+                value = checkpoint.tensor(f"layers.{layer}.{suffix}")
+                if target == "attn_sink":
+                    value = value[lane * heads:(lane + 1) * heads]
+                elif target == "gate_weight":
+                    value = value.float()
+                copy(target, value, layer, total_layers)
+            wo_a = checkpoint.tensor(f"layers.{layer}.attn.wo_a.weight")
+            wo_a = wo_a.reshape(M.o_groups, M.o_lora_rank, -1)[lane * groups:(lane + 1) * groups]
+            copy("wo_a", wo_a.transpose(-1, -2), layer, total_layers)
+            wo_b = checkpoint.tensor(f"layers.{layer}.attn.wo_b.weight")
+            width = groups * M.o_lora_rank
+            copy("wo_b", wo_b[:, lane * width:(lane + 1) * width].t(), layer, total_layers)
+            for local in range(self.local_experts):
+                expert = rank * self.local_experts + local
+                for projection in ("w1", "w2", "w3"):
+                    weight, scale = self.projection(f"layers.{layer}.ffn.experts.{expert}.{projection}",
+                                                    output_major=True)
+                    slot = layer * self.local_experts + local
+                    copy("routed_" + projection, weight, slot, total_layers * self.local_experts)
+                    copy("routed_" + projection + "_scale", scale, slot, total_layers * self.local_experts)
+            if (layer + 1) % 10 == 0:
+                print(f"A3_RANK_LAYER_WEIGHTS_READY {rank} {layer + 1}", flush=True)
+        for slot, layer in enumerate(M.kv_source_layer_ids):
+            copy("compressor_norm_weight", checkpoint.tensor(f"layers.{layer}.attn.compressor.norm.weight"), slot, len(M.kv_source_layer_ids))
+        c2a = [source for source in M.kv_source_layer_ids if M.compress_ratios[source] == 2]
+        for slot, layer in enumerate(c2a):
+            for name in ("wkv", "wgate"):
+                copy("c2a_compressor_" + name, checkpoint.tensor(f"layers.{layer}.attn.compressor.{name}.weight").t(), slot, len(c2a))
+        source = next(source for source in M.kv_source_layer_ids if M.compress_ratios[source] == 1)
+        copy("c1a_compressor_wkv", checkpoint.tensor(f"layers.{source}.attn.compressor.wkv.weight").t())
+        for slot, layer in enumerate(M.index_source_layer_ids):
+            prefix = f"layers.{layer}.attn.indexer."
+            weight, scale = self.projection(prefix + "wq_b")
+            copy("index_wq_b", weight, slot, len(M.index_source_layer_ids))
+            copy("index_wq_b_scale", scale, slot, len(M.index_source_layer_ids))
+            for target, suffix in (("index_wk", "wk.weight"), ("index_norm_weight", "k_norm.weight"),
+                                   ("index_weights_proj", "weights_proj.weight")):
+                name = prefix + suffix
+                shape, dtype = self.tensor_layouts[target]
+                if name not in checkpoint.weight_map and layer not in M.kv_source_layer_ids:
+                    value = torch.zeros(math.prod(shape) // len(M.index_source_layer_ids), dtype=dtype)
+                else:
+                    value = checkpoint.tensor(name)
+                    if target in ("index_wk", "index_weights_proj"):
+                        value = value.t().contiguous()
+                copy(target, value, slot, len(M.index_source_layer_ids))
+        for slot, layer in enumerate(M.engram_layer_ids):
+            prefix = f"layers.{layer}.engram."
+            copy("engram_wkv", checkpoint.tensor(prefix + "wkv.weight").t(), slot, 2)
+            gate = checkpoint.tensor(prefix + "q_weight").float() * checkpoint.tensor(prefix + "k_weight").float()
+            copy("engram_weight", gate, slot, 2)
+        copy("final_norm_weight", checkpoint.tensor("norm.weight"))
+        vocab = M.vocab_size // TP_SIZE
+        rows = torch.arange(lane * vocab, (lane + 1) * vocab)
+        copy("lm_head_weight", checkpoint.tensor_rows("head.weight", rows))
+
+    def lookup_rows(self, token_ids):
+        """Read the rotated BF16 checkpoint embedding rows."""
+        return self.checkpoint.tensor_rows("embed.weight", token_ids).bfloat16()
 
 
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--root", type=Path, required=True)
-    parser.add_argument("--output", type=Path)
-    args = parser.parse_args(argv)
-    result = inspect_checkpoint(args.root)
-    encoded = json.dumps(result, indent=2, sort_keys=True) + "\n"
-    if args.output:
-        args.output.parent.mkdir(parents=True, exist_ok=True)
-        args.output.write_text(encoded, encoding="utf-8")
-    print(encoded, end="")
-    return 0 if result["status"] == "metadata_verified" else 1
-
-
-class ResidentCheckpointOperands(CheckpointOperands):
-    """Cache model boundary weights while streaming expert source tensors once."""
-
-    def __init__(self, root):
-        super().__init__(root)
-        self.boundaries = {}
-        self.frozen = False
-        self.preparations = {}
-        self._sources = {}
-        self._source_stack = ExitStack()
-        self.file_open_calls = 0
-
-    def _source(self, path):
-        if path not in self._sources:
-            self._sources[path] = self._source_stack.enter_context(super()._source(path))
-            self.file_open_calls += 1
-        return nullcontext(self._sources[path])
-
-    def seal(self):
-        """Close initialization file handles and prohibit further static reads."""
-        self.frozen = True
-        self._source_stack.close()
-        self._sources.clear()
-
-    def close(self):
-        self.seal()
-        self.boundaries.clear()
-
-    def load(self, name):
-        if name in self.boundaries:
-            return self.boundaries[name]
-        if self.frozen:
-            raise RuntimeError("Static checkpoint reads are disabled after session preload: " + name)
-        if name in self.consumed:
-            raise RuntimeError("Logical checkpoint tensor was already read: " + name)
-        value = super().load(name)
-        self.consumed[name]["read_calls"] = 1
-        if name in ("embed.weight", "norm.weight", "head.weight"):
-            self.boundaries[name] = value
-        return value
-
-    def read_expert(self, prefix):
-        self.preparations[prefix] = self.preparations.get(prefix, 0) + 1
-        return super().read_expert(prefix)
-
-
-def _pack_routed_slot(operands, grouped, local):
-    """Write one expert directly into its rank-local blocked weights and channel scales."""
-    gate_up, gate_scale, down, down_scale = (value[local] for value in grouped)
-    gate, up = gate_up.chunk(2)
-    gate_channels, up_channels = gate_scale.chunk(2)
-    hidden = down_scale.numel()
-    intermediate = gate_channels.numel()
-    for stem, weight, scale in (("w1", gate, gate_channels), ("w3", up, up_channels), ("w2", down, down_scale)):
-        source = operands[stem + ".weight"]
-        expected = (hidden, intermediate) if stem == "w2" else (intermediate, hidden)
-        if source.shape != expected:
-            raise ValueError(f"Routed expert {stem} has shape {tuple(source.shape)}, expected {expected}")
-        pack_blocked_weight(source.T, out=weight)
-        scale.copy_(operands[stem + ".weight_scale"].reshape_as(scale))
-
-
-def pack_routed_layer(reader, layer, ownership, packers):
-    """Pack the contiguous local expert rows and scales for one layer and EP rank."""
-    grouped = None
-    pending = deque()
-    for expert, local in ownership:
-        if len(pending) == ROUTED_PACK_WORKERS:
-            pending.popleft().result()
-        operands = reader.read_expert(f"layers.{layer}.ffn.experts.{expert}")
-        if grouped is None:
-            intermediate, hidden = operands["w1.weight"].shape
-            rows = hidden * intermediate // BLOCKED_INT8_COLUMNS
-            shapes = ((2 * rows, BLOCKED_INT8_COLUMNS), (2 * intermediate,), (rows, BLOCKED_INT8_COLUMNS), (hidden,))
-            dtypes = (torch.int8, torch.float32, torch.int8, torch.float32)
-            grouped = [torch.empty((len(ownership), *shape), dtype=dtype) for shape, dtype in zip(shapes, dtypes)]
-        pending.append(packers.submit(_pack_routed_slot, operands, grouped, local))
-        del operands
-    for future in pending:
-        future.result()
-    return grouped
-
-
-class ResidentNetworkWeights:
-    """Retain prepacked compute weights, with routed experts sharded by their actual EP owner."""
-
-    def __init__(self, checkpoint, topology, model_config, runtime):
-        self.reader = ResidentCheckpointOperands(checkpoint)
-        self.layout = ExpertParallelConfig(topology["dp"], topology["tp"], topology["ep"], 384)
-        self.model_config, self.runtime = model_config, runtime
-        self.layers, self.experts, self.heads = {}, {}, {}
-        self.grouped_experts = {}
-        self.routed_banks = {}
-        self.layer_receipts = {}
-        self.load_seconds, self.load_calls = 0.0, 0
-        self.ready = False
-
-    def preload(self, progress=None):
-        """Stream each checkpoint operand into its persistent compute owner before token execution."""
-        if self.ready or self.layers:
-            raise ValueError("Resident weight preload is a single generation-scoped operation")
-        begin = perf_counter()
-        world, tp = self.layout.ep, self.layout.tp
-        ranks = range(world)
-        for layer in range(FLASH.num_hidden_layers):
-            if progress is not None:
-                progress(dict(stage="loading_resident_weights", layer=layer, epoch=0))
-            prefix = f"layers.{layer}."
-            names = [
-                name
-                for name in self.reader.index
-                if name.startswith(prefix) and ".ffn.experts." not in name
-                and ".ffn.shared_experts." not in name and ".engram.embed." not in name
-            ]
-            raw = {name: self.reader.load(name) for name in names}
-            operands = prepare_product_operands(raw, layer, role=resolve_layer_role(layer))
-            self.reader.preparations[prefix + "projections"] = 1
-            raw[prefix + "ffn.gate.weight"] = raw[prefix + "ffn.gate.weight"].float()
-            for name in (
-                "hc_ffn_fn",
-                "hc_ffn_scale",
-                "hc_ffn_base",
-                "ffn_norm.weight",
-                "ffn.gate.weight",
-                "ffn.gate.bias",
-                "ffn.gate.bias_vl",
-            ):
-                self.runtime.pin(raw[prefix + name], ranks, readonly=True, name=prefix + name)
-            for name, value in operands.items():
-                if name in ("wo_a", "wo_a_grouped_prefill", "wo_b"):
-                    continue
-                self.runtime.pin(value, ranks, readonly=True, name=prefix + name)
-            for rank in ranks:
-                lane = rank % tp
-                groups, width = 8 // tp, 8192 // tp
-                for name, value in (
-                    ("wo_a", operands["wo_a_grouped_prefill"][lane * groups : (lane + 1) * groups]),
-                    ("wo_b", operands["wo_b"][lane * width : (lane + 1) * width]),
-                ):
-                    self.runtime.pin(value, [rank], readonly=True, name=prefix + name)
-            role = resolve_layer_role(layer)
-            if role["engram_slot"] is not None:
-                engram = prefix + "engram"
-                projection = raw[engram + ".wkv.weight"].T.contiguous()
-                operands["engram_projection"] = projection
-                self.runtime.pin(projection, ranks, readonly=True, name=engram + ".wkv.kn")
-                for name in ("q_weight", "k_weight"):
-                    self.runtime.pin(raw[engram + "." + name], ranks, readonly=True, name=engram + "." + name)
-            self.layers[layer] = dict(
-                raw=raw,
-                operands=operands,
-                expert=lambda rank, expert, layer=layer: self.expert(layer, rank, expert),
-                grouped_expert=lambda rank, layer=layer: self.grouped_experts[layer, rank],
-            )
-            shared = self.reader.expert(prefix + "ffn.shared_experts", partitions=tp)
-            for rank in ranks:
-                self.experts[layer, rank, None] = tuple(self.runtime.weight(value, rank) for value in shared)
-            del shared
-            with ThreadPoolExecutor(max_workers=ROUTED_PACK_WORKERS, thread_name_prefix="routed-pack") as packers:
-                for rank in ranks:
-                    self._preload_routed(layer, rank, packers)
-            self.layer_receipts[layer] = dict(
-                original_names=names,
-                policy="generation-scoped resident compute weights",
-                routed_experts=384,
-                shared_replicas=world,
-            )
-        embedding, norm, head = (
-            self.reader.load(name) for name in ("embed.weight", "norm.weight", "head.weight")
-        )
-        rows = embedding.shape[0] // tp
-        for rank in ranks:
-            lane = rank % tp
-            self.runtime.pin(
-                embedding.narrow(0, lane * rows, rows), [rank], readonly=True, name="embed.weight"
-            )
-            self.runtime.pin(norm, [rank], readonly=True, name="norm.weight")
-            if lane not in self.heads:
-                self.heads[lane] = head.narrow(0, lane * rows, rows).T.contiguous()
-            self.runtime.pin(self.heads[lane], [rank], readonly=True, name="head.weight.kn")
-        self.ready = True
-        self.load_seconds = perf_counter() - begin
-        self.load_calls = self.reader.read_calls
-        self.runtime.stats.update(
-            routed_weight_banks=sum(len(banks) for banks in self.routed_banks.values()),
-            routed_weight_layer_views=sum(len(views) for views in self.grouped_experts.values()),
-            weight_preload_seconds=self.load_seconds,
-            checkpoint_preload_read_calls=self.reader.read_calls,
-            checkpoint_preload_read_seconds=self.reader.read_seconds,
-        )
-
-    def _preload_routed(self, layer, rank, packers):
-        """Pack one rank's experts and fill the four layer slices of its resident banks."""
-        ownership = self.layout.ownership(rank)
-        grouped = pack_routed_layer(self.reader, layer, ownership, packers)
-        shapes = [value.shape[1:] for value in grouped]
-        layers = [value.flatten(0, 1) for value in grouped]
-        if rank not in self.routed_banks:
-            self.routed_banks[rank] = tuple(
-                self.runtime.allocate_weight((FLASH.num_hidden_layers, *value.shape), value.dtype, rank)
-                for value in layers
-            )
-        layer_views = tuple(self.runtime.upload_weight_layer(bank, layer, value, rank)
-                            for bank, value in zip(self.routed_banks[rank], layers))
-        self.grouped_experts[layer, rank] = layer_views
-        for expert, local in ownership:
-            aliases = tuple(
-                self.runtime.workers[rank].view_tensor(
-                    owner, shape, byte_offset=local * math.prod(shape) * owner.dtype.itemsize,
-                ) for owner, shape in zip(layer_views, shapes)
-            )
-            for value in aliases:
-                self.runtime.retain_alias(value)
-            self.experts[layer, rank, expert] = aliases
-
-    def for_layer(self, layer):
-        if not self.ready or layer not in self.layers:
-            raise ValueError("Every resident layer must be loaded before execution")
-        return self.layers[layer]
-
-    def raw_for_layer(self, layer):
-        return self.for_layer(layer)["raw"]
-
-    def projection_for_layer(self, layer):
-        return self.for_layer(layer)["operands"]["engram_projection"]
-
-    def expert(self, layer, rank, expert):
-        if expert is not None and self.layout.owner(expert) != rank:
-            raise ValueError("Resident expert belongs to another EP rank")
-        return self.experts[layer, rank, expert]
-
-    def head_for_rank(self, rank):
-        return self.heads[rank % self.layout.tp]
-
-    def release_current(self):
-        """Preserve generation-scoped layers across all layer and token boundaries."""
-
-    def close(self):
-        self.layers.clear()
-        self.experts.clear()
-        self.grouped_experts.clear()
-        self.routed_banks.clear()
-        self.heads.clear()
-        self.reader.close()
-
-
-def prepare_product_operands(raw, layer_id=0, *, role=None):
-    """Pack fixed INT8 projections once and prepare grouped BF16 Prefill weights."""
-    from .cache import resolve_layer_role
-
-    role = resolve_layer_role(layer_id, role)
-    layer = f"layers.{layer_id}"
-    prepared = {}
-    for projection in ("wq_a", "wq_b", "wkv"):
-        prefix = f"{layer}.attn.{projection}."
-        weight, scale = prepare_ecotech_dynamic_weight(
-            raw[prefix + "weight"],
-            raw[prefix + "weight_scale"],
-            raw[prefix + "weight_offset"],
-        )
-        prepared[projection] = weight
-        prepared[projection + "_scale"] = scale
-    wo_a, wo_b = raw[f"{layer}.attn.wo_a.weight"], raw[f"{layer}.attn.wo_b.weight"]
-    if wo_a.dtype != torch.bfloat16 or wo_b.dtype != torch.bfloat16:
-        raise ValueError("Output projections require original BF16 weights")
-    if tuple(wo_a.shape) != (8192, 4096) or tuple(wo_b.shape) != (5120, 8192):
-        raise ValueError("Output projection geometry differs")
-    prepared["wo_a"] = wo_a.reshape(8, 1024, 4096).transpose(1, 2).contiguous()
-    prepared["wo_a_grouped_prefill"] = wo_a.reshape(8, 1024, 4096).contiguous()
-    prepared["wo_b"] = wo_b.T.contiguous()
-    names = dict(
-        attn_norm=f"{layer}.attn_norm.weight",
-        q_norm=f"{layer}.attn.q_norm.weight",
-        kv_norm=f"{layer}.attn.kv_norm.weight",
-        sink=f"{layer}.attn.attn_sink",
-        hc_function=f"{layer}.hc_attn_fn",
-        hc_scale=f"{layer}.hc_attn_scale",
-        hc_base=f"{layer}.hc_attn_base",
-    )
-    for target, source in names.items():
-        prepared[target] = raw[source].contiguous()
-    if role["mode"] == "full":
-        compressor = f"{layer}.attn.compressor"
-        indexer = f"{layer}.attn.indexer"
-        prepared["compressor_wkv"] = raw[compressor + ".wkv.weight"].T.contiguous()
-        if role["ratio"] == 2:
-            prepared["compressor_wgate"] = raw[compressor + ".wgate.weight"].T.contiguous()
-        prepared["compressor_norm"] = raw[compressor + ".norm.weight"].contiguous()
-        prepared["index_wk"] = raw[indexer + ".wk.weight"].T.contiguous()
-        prepared["index_norm"] = raw[indexer + ".k_norm.weight"].contiguous()
-        prepared["index_weights"] = raw[indexer + ".weights_proj.weight"].T.contiguous()
-        prepared["index_wqb"], prepared["index_wqb_scale"] = prepare_ecotech_dynamic_weight(
-            raw[indexer + ".wq_b.weight"],
-            raw[indexer + ".wq_b.weight_scale"],
-            raw[indexer + ".wq_b.weight_offset"],
-        )
-    if role["mode"] == "reindex":
-        indexer = f"{layer}.attn.indexer"
-        prepared["index_weights"] = raw[indexer + ".weights_proj.weight"].T.contiguous()
-        prepared["index_wqb"], prepared["index_wqb_scale"] = prepare_ecotech_dynamic_weight(
-            raw[indexer + ".wq_b.weight"],
-            raw[indexer + ".wq_b.weight_scale"],
-            raw[indexer + ".wq_b.weight_offset"],
-        )
-    if any(value.device.type != "cpu" for value in prepared.values()):
-        raise ValueError("Operand preparation requires CPU tensors")
-    return prepared
+def audit_checkpoint(weights):
+    """Check real projection formats, TP shard boundaries, Engram rows and rotation blocks."""
+    checkpoint = weights.checkpoint
+    checks = []
+    suffixes = ("attn.wq_a", "attn.wq_b", "attn.wkv", "ffn.shared_experts.w1",
+                "ffn.experts.0.w1", "ffn.experts.383.w2")
+    for layer in (0, 1, 2, 3, 14, 20, 21, 24):
+        for suffix in suffixes:
+            stem = f"layers.{layer}.{suffix}"
+            weight, scale = weights.projection(stem)
+            shape = checkpoint.descriptor(stem + ".weight")["shape"]
+            if tuple(weight.shape) != tuple(reversed(shape)):
+                raise ValueError(f"projection transpose shape mismatch: {stem}")
+            if suffix == "attn.wq_b":
+                width = weight.shape[1] // TP_SIZE
+                shards = [weights.projection(stem, output_slice=slice(lane * width, (lane + 1) * width))
+                          for lane in range(TP_SIZE)]
+                if not torch.equal(torch.cat([shard[0] for shard in shards], 1), weight):
+                    raise ValueError(f"Q-B payload reconstruction mismatch: {stem}")
+                if not torch.equal(torch.cat([shard[1] for shard in shards], 1), scale):
+                    raise ValueError(f"Q-B scale reconstruction mismatch: {stem}")
+            checks.append({"name": stem, "shape": list(weight.shape), "scale_shape": list(scale.shape),
+                           "status": "pass"})
+        for suffix in ("attn.wo_a.weight", "attn.wo_b.weight"):
+            name = f"layers.{layer}.{suffix}"
+            weight = checkpoint.tensor(name)
+            if weight.dtype != torch.bfloat16:
+                raise ValueError(f"output projection must be BF16: {name}")
+            if suffix == "attn.wo_a.weight":
+                logical = weight.reshape(M.o_groups, M.o_lora_rank, -1)
+                groups = M.o_groups // TP_SIZE
+                shards = [logical[lane * groups:(lane + 1) * groups].transpose(-1, -2).contiguous()
+                          for lane in range(TP_SIZE)]
+                restored = torch.cat(shards).transpose(-1, -2).reshape_as(weight)
+            else:
+                width = weight.shape[1] // TP_SIZE
+                shards = [weight[:, lane * width:(lane + 1) * width].t().contiguous() for lane in range(TP_SIZE)]
+                restored = torch.cat(shards).t()
+            if not torch.equal(restored, weight):
+                raise ValueError(f"output projection reconstruction mismatch: {name}")
+            checks.append({"name": name, "status": "pass"})
+    vocab = M.vocab_size // TP_SIZE
+    head_rows = torch.tensor([value for lane in range(TP_SIZE) for value in (lane * vocab, (lane + 1) * vocab - 1)])
+    head = checkpoint.tensor_rows("head.weight", head_rows)
+    if head.shape != (8, M.hidden_size) or head.dtype != torch.bfloat16 or not bool(torch.isfinite(head).all()):
+        raise ValueError("invalid LM head boundary rows")
+    for layer in M.engram_layer_ids:
+        prefix = f"layers.{layer}.engram.embed."
+        shape = checkpoint.descriptor(prefix + "weight")["shape"]
+        rows = torch.tensor([0, shape[0] - 1])
+        payload, scales = checkpoint.tensor_rows(prefix + "weight", rows), checkpoint.tensor_rows(prefix + "scale", rows)
+        if payload.dtype != torch.int8 or scales.dtype != torch.float32 or scales.shape != (2, 8):
+            raise ValueError(f"invalid Engram INT8/FP32 table: {prefix}")
+        decoded = payload.float() * scales.repeat_interleave(32, dim=-1)
+        if not bool(torch.isfinite(decoded).all()):
+            raise ValueError(f"nonfinite Engram table: {prefix}")
+        checks.append({"name": prefix.removesuffix("."), "boundary_rows": rows.tolist(), "status": "pass"})
+    rotation = checkpoint.rotation_blocks()
+    checks.append({"name": "global_rotation", "shape": list(rotation.shape), "status": "pass"})
+    return {"checkpoint_identity": checkpoint.identity, "weight_layout": WEIGHT_LAYOUT_VERSION,
+            "resident_bytes_per_rank": weights.bytes_per_rank, "resident_byte_breakdown": weights.byte_breakdown,
+            "resident_gib_per_rank": weights.bytes_per_rank / 1024**3, "projection_and_sharding_checks": checks,
+            "lm_head_boundary_rows": head_rows.tolist(), "status": "host_weight_format_and_sharding_pass",
+            "limits": "Device model output, peak HBM and performance acceptance remain separate checks."}
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    import argparse
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--checkpoint", required=True, type=Path)
+    parser.add_argument("--audit", action="store_true")
+    parser.add_argument("--report", type=Path)
+    args = parser.parse_args()
+    checkpoint = Checkpoint(args.checkpoint)
+    weights = ResidentWeights(checkpoint)
+    report = {"layout_version": WEIGHT_LAYOUT_VERSION, "checkpoint_identity": checkpoint.identity,
+              "resident_bytes_per_rank": weights.bytes_per_rank, "resident_byte_breakdown": weights.byte_breakdown,
+              "resident_gib_per_rank": weights.bytes_per_rank / 1024**3,
+              "topology": {"dp": 4, "tp": 4, "ep": 16, "local_experts": 24}}
+    if args.audit:
+        report.update(audit_checkpoint(weights))
+    if args.report:
+        args.report.write_text(json.dumps(report, indent=2) + "\n")
+    print(json.dumps(report, indent=2))

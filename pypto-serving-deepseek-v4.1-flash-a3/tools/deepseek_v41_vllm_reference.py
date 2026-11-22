@@ -18,9 +18,8 @@ import traceback
 
 import torch
 
-from models.deepseek_v4_1_flash_a3.runtime_config import MAX_PREFILL_CHUNK_SIZE
 from tools.deepseek_v41_accuracy import (
-    MAX_CONTEXT, TOPOLOGY, allocated_devices, load_cases, new_capture, save_case, write_json,
+    MAX_CONTEXT, MAX_PREFILL_CHUNK_SIZE, TOPOLOGY, allocated_devices, load_cases, new_capture, save_case, write_json,
 )
 
 

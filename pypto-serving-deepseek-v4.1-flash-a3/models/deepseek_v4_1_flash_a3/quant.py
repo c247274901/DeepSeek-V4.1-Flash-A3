@@ -6,833 +6,627 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Shared W8A8 goldens and phase-specific device quantization."""
+"""V4.1 device and host quantization, checkpoint layouts, and weight fixtures."""
 
-import pypto.language as pl
+import sys
+from pathlib import Path
+
+if not __package__:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    __package__ = "models.deepseek_v4_1_flash_a3"
+
 import torch
-from .operator_config import CONTRACT
+import pypto.language as pl
 
-K_TILE = 256
-N_TILE = 64
-VEC_M_TILE = 8
-WHOLE_ROW_TILE = 5120
-PREFILL_QUANT_WORKERS = 48
-QUANT_REDUCE_TILE = 1024
-
-INT8_AMAX_EPS = CONTRACT.int8_amax_epsilon
+from .config import FLASH as M
 
 
-DECODE_INT8_AMAX_EPS = CONTRACT.int8_amax_epsilon
+# model config
+MX_GROUP = M.weight_block_size[0]
+
+# tiling
+QUANT_K_TILE = 256
+QUANT_SCALE_TILE = QUANT_K_TILE // 32
+CODE_ROWS_DYN = pl.dynamic("A3_CODE_ROWS_DYN")
+CODE_COLS_DYN = pl.dynamic("A3_CODE_COLS_DYN")
 
 
-CHECKPOINT_ROWS = pl.dynamic("CHECKPOINT_QUANT_ROWS")
+FP4_VALUES = torch.tensor(
+    [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
+    dtype=torch.float32,
+)
+
+# FP4 E2M1 nibble values encoded as FP8 E4M3FN bytes. The device kernel
+# gathers two adjacent FP8 bytes from this table for every packed input byte.
+FP4_E4M3_CODES = torch.tensor(
+    [0x00, 0x30, 0x38, 0x3C, 0x40, 0x44, 0x48, 0x4C,
+     0x80, 0xB0, 0xB8, 0xBC, 0xC0, 0xC4, 0xC8, 0xCC],
+    dtype=torch.int16,
+)
 
 
 @pl.jit.inline(auto_scope=False)
-def _checkpoint_codes(
-    value: pl.Tile[[CHECKPOINT_ROWS, K_TILE], pl.FP32],
-    denominator: pl.Tile[[CHECKPOINT_ROWS, 1], pl.FP32],
-    inverse: pl.Tile[[CHECKPOINT_ROWS, 1], pl.FP32],
+def encode_fp8(value: pl.Tile[[CODE_ROWS_DYN, CODE_COLS_DYN], pl.FP32], rows: pl.constexpr, cols: pl.constexpr):
+    """Encode finite FP32 values as saturated E4M3FN bytes with nearest-even rounding."""
+    value = pl.reshape(value, [rows, cols])
+    bits = pl.reinterpret_view(value, pl.INT32)
+    sign = pl.ands(pl.cast(pl.cast(pl.shrs(bits, 24), pl.FP32), pl.INT16, mode="rint"), 128)
+    magnitude = pl.minimum(pl.abs(value), 448.0)
+    absolute_bits = pl.reinterpret_view(magnitude, pl.INT32)
+    tie = pl.cast(pl.cast(pl.ands(pl.cast(pl.cast(pl.shrs(absolute_bits, 20), pl.FP32), pl.INT16, mode="rint"), 1), pl.FP32), pl.INT32, mode="rint")
+    rounded_bits = pl.add(pl.add(absolute_bits, 524287), tie)
+    normal_codes = pl.sub(pl.shrs(rounded_bits, 20), 960)
+    subnormal_value = pl.mul(magnitude, 512.0)
+    subnormal_codes = pl.cast(subnormal_value, pl.INT32, mode="rint")
+    predicate = pl.tile.cmps(magnitude, 0.015625, cmp_type=2)
+    select_tmp = pl.create_tile([1, 16], dtype=pl.UINT32)
+    codes = pl.tile.sel(predicate, subnormal_codes, normal_codes, select_tmp)
+    codes = pl.add(pl.minimum(pl.maximum(codes, 0), 126), pl.cast(pl.cast(sign, pl.FP32), pl.INT32, mode="rint"))
+    signed = pl.sub(codes, pl.mul(pl.shrs(codes, 7), 256))
+    return pl.reinterpret_view(pl.cast(signed, pl.INT8), pl.UINT8)
+
+
+@pl.jit.inline(auto_scope=False)
+def decode_fp8(payload: pl.Tile[[CODE_ROWS_DYN, CODE_COLS_DYN], pl.UINT8], rows: pl.constexpr, cols: pl.constexpr):
+    """Decode E4M3FN bytes to exact BF16 values."""
+    fixed = pl.reshape(payload, [rows, cols])
+    signed_bytes = pl.reinterpret_view(fixed, pl.INT8)
+    codes = pl.ands(pl.cast(pl.cast(signed_bytes, pl.FP16), pl.INT16, mode="rint"), 255)
+    magnitude = pl.ands(codes, 127)
+    exponent = pl.shrs(magnitude, 3)
+    mantissa = pl.ands(magnitude, 7)
+    factor_bits = pl.shls(pl.add(pl.cast(pl.cast(exponent, pl.FP32), pl.INT32, mode="rint"), 117), 23)
+    factor = pl.reinterpret_view(factor_bits, pl.FP32)
+    significand = pl.cast(pl.add(mantissa, 8), pl.FP32)
+    normal = pl.mul(significand, factor)
+    subnormal = pl.mul(pl.cast(mantissa, pl.FP32), 0.001953125)
+    normal_mask = pl.cast(pl.minimum(exponent, 1), pl.FP32)
+    normal = pl.mul(normal, normal_mask)
+    subnormal_mask = pl.sub(pl.mul(normal_mask, -1.0), -1.0)
+    subnormal = pl.mul(subnormal, subnormal_mask)
+    value = pl.add(normal, subnormal)
+    sign = pl.cast(pl.shrs(codes, 7), pl.FP32)
+    signed_factor = pl.add(pl.mul(sign, -2.0), 1.0)
+    return pl.cast(pl.mul(value, signed_factor), pl.BF16, mode="rint")
+
+
+@pl.jit.inline(auto_scope=False)
+def decode_scale(payload: pl.Tile[[CODE_ROWS_DYN, CODE_COLS_DYN], pl.UINT8], rows: pl.constexpr, cols: pl.constexpr):
+    """Decode E8M0 bytes to FP32 powers of two."""
+    fixed = pl.reshape(payload, [rows, cols])
+    signed_bytes = pl.reinterpret_view(fixed, pl.INT8)
+    widened = pl.ands(pl.cast(pl.cast(signed_bytes, pl.FP16), pl.INT16, mode="rint"), 255)
+    codes = pl.cast(pl.cast(widened, pl.FP32), pl.INT32, mode="rint")
+    normal_bits = pl.shls(pl.maximum(codes, 1), 23)
+    normal = pl.reinterpret_view(normal_bits, pl.FP32, shape=[rows, cols])
+    predicate = pl.tile.cmps(codes, 0, cmp_type=0)
+    subnormal_bits = pl.tile.full([rows, cols], dtype=pl.INT32, value=4194304)
+    subnormal = pl.reinterpret_view(subnormal_bits, pl.FP32, shape=[rows, cols])
+    select_tmp = pl.create_tile([1, 16], dtype=pl.UINT32)
+    return pl.tile.sel(predicate, subnormal, normal, select_tmp)
+
+
+@pl.jit.inline(auto_scope=False)
+def a3_a_scale(raw: pl.Tensor, rows: pl.constexpr, groups: pl.constexpr):
+    """View logical A-side scale bytes in ND order."""
+    return pl.reshape(raw, [rows, groups])
+
+
+@pl.jit.inline(auto_scope=False)
+def quantize_upward(source: pl.Tensor, rows: pl.constexpr, width: pl.constexpr):
+    """Quantize SwiGLU rows to E4M3FN with upward group-32 E8M0 scales."""
+    groups = pl.reshape(pl.cast(source, pl.FP32), [rows * (width // 32), 32])
+    tmp = pl.create_tile([rows * (width // 32), 32], dtype=pl.FP32)
+    maximum = pl.maximum(pl.row_max(pl.abs(groups), tmp_tile=tmp), 1e-4)
+    bits = pl.reinterpret_view(pl.mul(maximum, 1.0 / 448.0), pl.INT32)
+    exponent = pl.shrs(pl.add(bits, 8388607), 23)
+    scale = pl.reinterpret_view(pl.shls(exponent, 23), pl.FP32)
+    normalized = pl.row_expand_div(groups, scale)
+    encoded = encode_fp8(normalized, rows * (width // 32), 32)
+    payload = pl.reshape(encoded, [rows, width])
+    signed = pl.sub(exponent, pl.mul(pl.shrs(exponent, 7), 256))
+    codes = pl.reinterpret_view(pl.cast(signed, pl.INT8), pl.UINT8)
+    return payload, pl.reshape(codes, [rows, width // 32])
+
+
+@pl.jit.inline(auto_scope=False)
+def encode_fp4(
+    value: pl.Tile[[CODE_ROWS_DYN, CODE_COLS_DYN], pl.FP32],
+    scale: pl.Tile[[CODE_ROWS_DYN, 1], pl.FP32],
+    rows: pl.constexpr,
+    cols: pl.constexpr,
 ):
-    """Resolve signed half-way cases against the original BF16 row peak."""
+    """Pack E2M1 pairs with nearest-even rounding against exact scaled midpoints."""
+    value = pl.reshape(value, [rows, cols])
+    scale = pl.reshape(scale, [rows, 1])
     magnitude = pl.abs(value)
-    # Scale both sides of the midpoint comparison by a power of two to keep finite BF16 inputs in range.
-    scaled_magnitude = pl.mul(magnitude, 127.0 / 128.0)
-    estimate = pl.row_expand_mul(scaled_magnitude, inverse)
-    floor_int = pl.cast(pl.minimum(estimate, 127.0), pl.INT32, mode="floor")
-    lower = pl.cast(floor_int, pl.FP32)
-    midpoint = pl.row_expand_mul(pl.add(lower, 0.5), denominator)
-    upper = pl.add(lower, 1.0)
-    nearest = pl.tile.select(pl.tile.cmp(scaled_magnitude, midpoint, cmp_type=4), upper, lower)
-    odd = pl.cast(pl.ands(pl.cast(lower, pl.INT16), 1), pl.FP32)
-    nearest = pl.tile.select(pl.tile.cmp(scaled_magnitude, midpoint, cmp_type=0), pl.add(lower, odd), nearest)
-    signed = pl.tile.select(pl.tile.cmps(value, 0.0, cmp_type=2), pl.neg(nearest), nearest)
-    encoded = pl.cast(signed, pl.INT8, mode="rint")
-    return encoded
+    lanes = pl.tile.full([rows, cols], dtype=pl.FP32, value=1.0)
+    delta0 = pl.sub(magnitude, pl.row_expand_mul(lanes, pl.mul(scale, 0.25)))
+    delta1 = pl.sub(magnitude, pl.row_expand_mul(lanes, pl.mul(scale, 0.75)))
+    delta2 = pl.sub(magnitude, pl.row_expand_mul(lanes, pl.mul(scale, 1.25)))
+    delta3 = pl.sub(magnitude, pl.row_expand_mul(lanes, pl.mul(scale, 1.75)))
+    delta4 = pl.sub(magnitude, pl.row_expand_mul(lanes, pl.mul(scale, 2.5)))
+    delta5 = pl.sub(magnitude, pl.row_expand_mul(lanes, pl.mul(scale, 3.5)))
+    delta6 = pl.sub(magnitude, pl.row_expand_mul(lanes, pl.mul(scale, 5.0)))
+    step0 = pl.shrs(pl.sub(pl.reinterpret_view(delta0, pl.INT32), 1), 31)
+    step1 = pl.shrs(pl.reinterpret_view(delta1, pl.INT32), 31)
+    step2 = pl.shrs(pl.sub(pl.reinterpret_view(delta2, pl.INT32), 1), 31)
+    step3 = pl.shrs(pl.reinterpret_view(delta3, pl.INT32), 31)
+    step4 = pl.shrs(pl.sub(pl.reinterpret_view(delta4, pl.INT32), 1), 31)
+    step5 = pl.shrs(pl.reinterpret_view(delta5, pl.INT32), 31)
+    step6 = pl.shrs(pl.sub(pl.reinterpret_view(delta6, pl.INT32), 1), 31)
+    lower = pl.add(pl.add(step0, step1), pl.add(step2, step3))
+    upper = pl.add(pl.add(step4, step5), pl.add(step6, 7))
+    index = pl.add(lower, upper)
+    sign = pl.shrs(pl.reinterpret_view(value, pl.INT32), 31)
+    codes = pl.reshape(pl.sub(index, pl.mul(sign, 8)), [1, rows * cols])
+    low = pl.tile.gather_mask(codes, mask_pattern=pl.tile.MaskPattern.P0101, output_dtype=pl.INT32)
+    high = pl.tile.gather_mask(codes, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32)
+    packed = pl.add(low, pl.mul(high, 16))
+    signed = pl.sub(packed, pl.mul(pl.shrs(packed, 7), 256))
+    return pl.reinterpret_view(pl.cast(signed, pl.INT8), pl.UINT8)
 
 
 @pl.jit.inline(auto_scope=False)
-def _encode_checkpoint_panel(
-    source: pl.Tensor, payload: pl.Tensor, row: pl.Scalar[pl.INDEX],
-    k0: pl.Scalar[pl.INDEX], rows: pl.Scalar[pl.INDEX],
-    denominator: pl.Tile[[8, 1], pl.FP32], inverse: pl.Tile[[8, 1], pl.FP32],
-):
-    raw = pl.load(source, [row, k0], [8, 256], valid_shape=[rows, 256])
-    padded = pl.set_validshape(pl.fillpad(raw, pad_value=pl.PadValue.zero), 8, 256)
-    value = pl.cast(padded, pl.FP32)
-    encoded = _checkpoint_codes(value, denominator, inverse)
-    pl.store(encoded, [row, k0], payload)
+def fp4_bf16_bits(code: pl.Tile[[CODE_ROWS_DYN, CODE_COLS_DYN], pl.INT16]):
+    """Map an E2M1 nibble to the corresponding BF16 sign, exponent and mantissa."""
+    magnitude = pl.ands(code, 7)
+    normal = pl.add(pl.shls(magnitude, 6), 0x3F00)
+    small = pl.mul(pl.ands(magnitude, 1), 0x3F00)
+    is_small = pl.tile.cmps(pl.cast(magnitude, pl.FP16), 2.0, cmp_type=2)
+    bits = pl.tile.select(is_small, small, normal)
+    return pl.or_(bits, pl.shls(pl.ands(code, 8), 12))
 
 
 @pl.jit.inline(auto_scope=False)
-def _quantize_cached_rows(
-    source: pl.Tensor, payload: pl.Tensor, scales: pl.Tensor, active: pl.Scalar[pl.INT32],
-    capacity: pl.Scalar[pl.INDEX], width: pl.constexpr, checkpoint: pl.constexpr,
-):
-    """Keep complete input rows in UB for the peak and midpoint passes."""
-    blocks = capacity // VEC_M_TILE
-    if not checkpoint:
-        blocks = (active + VEC_M_TILE - 1) // VEC_M_TILE
-    workers = pl.min(blocks, PREFILL_QUANT_WORKERS)
-    for worker in pl.spmd(workers, name_hint="prefill_token_quantize_whole_row"):
-        start = worker * blocks // workers
-        end = (worker + 1) * blocks // workers
-        for block in pl.pipeline(start, end, stage=2):
-            row = block * VEC_M_TILE
-            rows = pl.max(0, pl.min(VEC_M_TILE, active - row))
-            raw = pl.load(source, [row, 0], [VEC_M_TILE, width], valid_shape=[rows, width])
-            cached = pl.set_validshape(pl.fillpad(raw, pad_value=pl.PadValue.zero), VEC_M_TILE, width)
-            fp = pl.cast(cached, pl.FP32)
-            scratch = pl.create_tile([VEC_M_TILE, width], dtype=pl.FP32)
-            maximum = pl.row_max(pl.abs(fp), tmp_tile=scratch)
-            if checkpoint:
-                factor = pl.maximum(pl.mul(maximum, 1.0 / 127.0), 1e-30)
-                pl.store(factor, [row, 0], scales)
-                denominator = pl.mul(pl.maximum(maximum, 127e-30), 1.0 / 128.0)
-                inverse = pl.recip(denominator)
-                for k0 in pl.range(0, width, 256):
-                    part = pl.tile.slice(fp, [VEC_M_TILE, 256], [0, k0])
-                    encoded = _checkpoint_codes(part, denominator, inverse)
-                    pl.store(encoded, [row, k0], payload)
-            else:
-                row_peak = pl.reshape(maximum, [1, VEC_M_TILE])
-                numerator = pl.tile.full([1, VEC_M_TILE], dtype=pl.FP32, value=127.0)
-                inverse = pl.reshape(pl.div(numerator, pl.maximum(row_peak, 1e-30)), [VEC_M_TILE, 1])
-                scale = pl.mul(maximum, 1.0 / 127.0)
-                ones = pl.tile.full([VEC_M_TILE, 8], dtype=pl.FP32, value=1.0)
-                scale_rows = pl.row_expand_mul(ones, scale)
-                pl.store(pl.set_validshape(scale_rows, rows, 8), [row, 0], scales)
-                rounded = pl.cast(pl.row_expand_mul(fp, inverse), pl.INT32, mode="rint")
-                codes = pl.cast(rounded, pl.INT8, mode="trunc")
-                pl.store(pl.set_validshape(codes, rows, width), [row, 0], payload)
-    return payload, scales
+def decode_fp4(payload: pl.Tile[[CODE_ROWS_DYN, CODE_COLS_DYN], pl.UINT8], rows: pl.constexpr, width: pl.constexpr):
+    """Unpack E2M1 nibble pairs into BF16 rows."""
+    fixed = pl.reshape(payload, [rows, width // 2])
+    signed_bytes = pl.reinterpret_view(fixed, pl.INT8)
+    raw = pl.cast(pl.cast(signed_bytes, pl.FP16), pl.INT16, mode="rint")
+    low_word = fp4_bf16_bits(raw)
+    high_word = fp4_bf16_bits(pl.shrs(raw, 4))
+    low_lanes = pl.tile.full([rows, width], dtype=pl.INT16, value=0)
+    low_lanes = pl.tile.scatter_mask(low_lanes, low_word, mask_pattern=pl.tile.MaskPattern.P0101)
+    high_lanes = pl.tile.full([rows, width], dtype=pl.INT16, value=0)
+    high_lanes = pl.tile.scatter_mask(high_lanes, high_word, mask_pattern=pl.tile.MaskPattern.P1010)
+    return pl.reinterpret_view(pl.or_(low_lanes, high_lanes), pl.BF16)
 
 
 @pl.jit.inline(auto_scope=False)
-def quantize_projection_activation(
-    source: pl.Tensor, num_tokens: pl.Scalar[pl.INT32], width: pl.constexpr, dense_query: pl.constexpr,
+def quantize_bf16_to_mxfp8(
+    x: pl.Tensor,
+    t0: pl.Scalar[pl.INT32],
+    k0: pl.Scalar[pl.INT32],
+    rows: pl.Scalar[pl.INT32],
+    m_tile: pl.constexpr,
 ):
-    """Quantize the resident A3 checkpoint's padded rows with ties-to-even rounding."""
-    capacity = pl.tensor.dim(source, 0)
-    padded_rows = (capacity + 15) // 16 * 16
-    payload = pl.create_tensor([padded_rows, width], dtype=pl.INT8)
-    scale = pl.create_tensor([padded_rows, 1], dtype=pl.FP32)
-    if padded_rows <= 32:
-        panels = (width + QUANT_REDUCE_TILE - 1) // QUANT_REDUCE_TILE
-        partials = pl.create_tensor([padded_rows // 8 * panels, 8], dtype=pl.FP32)
-        with pl.spmd(padded_rows // 8 * panels, name_hint="quant_absmax") as partials_ready:
-            shard = pl.tile.get_block_idx()
-            shard_row = shard // panels * 8
-            shard_col = shard % panels * QUANT_REDUCE_TILE
-            shard_rows = pl.max(0, pl.min(8, num_tokens - shard_row))
-            shard_cols = pl.min(QUANT_REDUCE_TILE, width - shard_col)
-            raw = pl.tile.load(source, [shard_row, shard_col], [8, QUANT_REDUCE_TILE], valid_shape=[shard_rows, shard_cols])
-            padded = pl.set_validshape(pl.fillpad(raw, pad_value=pl.PadValue.zero), 8, QUANT_REDUCE_TILE)
-            absolute = pl.abs(pl.cast(padded, pl.FP32))
-            scratch = pl.create_tile([8, QUANT_REDUCE_TILE], dtype=pl.FP32)
-            shard_max = pl.reshape(pl.row_max(absolute, tmp_tile=scratch), [1, 8])
-            pl.tile.store(shard_max, [shard, 0], partials)
-        tiles = padded_rows // 8 * (width // 256)
-        workers = pl.min(tiles, 2 * pl.system.available_cluster_count())
-        with pl.spmd(workers, name_hint="quant_encode", deps=[partials_ready]):
-            worker = pl.tile.get_block_idx()
-            for block in pl.range(worker, tiles, workers):
-                group = block // (width // 256)
-                row = group * 8
-                k0 = block % (width // 256) * 256
-                rows = pl.max(0, pl.min(8, num_tokens - row))
-                maximum = pl.tile.full([1, 8], dtype=pl.FP32, value=0.0)
-                for panel in pl.range(panels):
-                    local = pl.load(partials, [group * panels + panel, 0], [1, 8])
-                    maximum = pl.maximum(maximum, local)
-                if k0 == 0:
-                    factor = pl.reshape(pl.maximum(pl.mul(maximum, 1.0 / 127.0), 1e-30), [8, 1])
-                    pl.store(factor, [row, 0], scale)
-                denominator = pl.reshape(pl.mul(pl.maximum(maximum, 127e-30), 1.0 / 128.0), [8, 1])
-                inverse = pl.recip(denominator)
-                _encode_checkpoint_panel(source, payload, row, k0, rows, denominator, inverse)
-    elif dense_query and width == 1280:
-        _quantize_cached_rows(source, payload, scale, num_tokens, padded_rows, width, True)
+    """Quantize BF16 activation tiles to OCP E4M3FN and packed E8M0 scales."""
+    source = pl.load(x, [t0, k0], [m_tile, QUANT_K_TILE], valid_shape=[rows, QUANT_K_TILE])
+    source = pl.fillpad(source, pad_value=pl.PadValue.zero)
+    source = pl.set_validshape(source, m_tile, QUANT_K_TILE)
+    source_fp32 = pl.cast(source, pl.FP32)
+    groups = pl.reshape(source_fp32, [m_tile * (QUANT_K_TILE // 32), 32])
+    reduce_tmp = pl.create_tile([m_tile * (QUANT_K_TILE // 32), 32], dtype=pl.FP32)
+    magnitude = pl.abs(groups)
+    maximum = pl.row_max(magnitude, tmp_tile=reduce_tmp)
+    bits = pl.reinterpret_view(maximum, pl.INT32)
+    biased_exponent = pl.shrs(bits, 23)
+    scale_exponent = pl.sub(biased_exponent, 8)
+    exponent = pl.maximum(scale_exponent, 0)
+    # Scale code zero has a zero reciprocal.
+    negative_exponent = pl.mul(exponent, -1)
+    reciprocal_exponent = pl.add(negative_exponent, 254)
+    nonzero_exponent = pl.minimum(exponent, 1)
+    reciprocal_code = pl.mul(reciprocal_exponent, nonzero_exponent)
+    reciprocal_bits = pl.shls(reciprocal_code, 23)
+    reciprocal = pl.reinterpret_view(reciprocal_bits, pl.FP32)
+    normalized = pl.row_expand_mul(groups, reciprocal)
+    normalized = pl.maximum(normalized, -448.0)
+    normalized = pl.minimum(normalized, 448.0)
+    payload_fp8 = encode_fp8(normalized, m_tile * (QUANT_K_TILE // 32), 32)
+    payload = pl.reshape(payload_fp8, [m_tile, QUANT_K_TILE])
+    sign_bit = pl.shrs(exponent, 7)
+    sign_offset = pl.mul(sign_bit, 256)
+    signed = pl.sub(exponent, sign_offset)
+    signed_codes = pl.cast(signed, pl.INT8)
+    codes = pl.reinterpret_view(signed_codes, pl.UINT8)
+    flat = pl.reshape(codes, [1, m_tile * (QUANT_K_TILE // 32)])
+    _pack_tmp = pl.create_tile([1, 96], dtype=pl.UINT8)
+    packed = pl.reshape(flat, [m_tile, QUANT_SCALE_TILE])
+    packed_scale = packed
+    return payload, packed_scale
+
+
+def decode_e8m0(scale: torch.Tensor) -> torch.Tensor:
+    """Decode UE8M0 storage codes into FP32 powers of two."""
+    codes = scale.contiguous().view(torch.uint8)
+    return torch.exp2(codes.to(torch.float32) - 127.0)
+
+
+def encode_e8m0(scale: torch.Tensor) -> torch.Tensor:
+    """Encode positive FP32 powers of two as UE8M0 storage codes."""
+    exponent = torch.round(torch.log2(scale.float())).clamp(-127, 128)
+    return (exponent + 127).to(torch.uint8)
+
+
+def pack_fp8_nz(weight: torch.Tensor) -> torch.Tensor:
+    """Return the A3 logical ND carrier layout."""
+    return weight.contiguous().view(torch.uint8)
+
+
+def unpack_fp8_nz(weight: torch.Tensor) -> torch.Tensor:
+    """Return the A3 logical ND carrier layout."""
+    return weight.contiguous().view(torch.float8_e4m3fn)
+
+
+def pack_mx_b_scale(scale: torch.Tensor) -> torch.Tensor:
+    """Return the A3 logical ND carrier layout."""
+    return scale.contiguous()
+
+
+def unpack_mx_b_scale(scale: torch.Tensor) -> torch.Tensor:
+    """Return the A3 logical ND carrier layout."""
+    return scale.contiguous()
+
+
+def _nearest_fp4_indices(values: torch.Tensor, *, round_to_even: bool = False) -> torch.Tensor:
+    table = FP4_VALUES[:8].to(values.device)
+    magnitude = values.abs().unsqueeze(-1)
+    if round_to_even:
+        order = torch.tensor([0, 2, 4, 6, 1, 3, 5, 7], device=values.device)
+        selected = (magnitude - table[order]).abs().argmin(dim=-1)
+        index = order[selected].to(torch.uint8)
     else:
-        workers = pl.max(1, pl.min(2 * pl.system.available_cluster_count(), padded_rows // 8))
-        for worker in pl.spmd(workers, name_hint="dynamic_int8_quant"):
-            for row in pl.range(worker * 8, padded_rows, workers * 8):
-                rows = pl.max(0, pl.min(8, num_tokens - row))
-                maximum = pl.tile.full([1, 8], dtype=pl.FP32, value=0.0)
-                for k0 in pl.range(0, width, QUANT_REDUCE_TILE):
-                    cols = pl.min(QUANT_REDUCE_TILE, width - k0)
-                    reduce_raw = pl.load(source, [row, k0], [8, QUANT_REDUCE_TILE], valid_shape=[rows, cols])
-                    reduce_padded = pl.set_validshape(pl.fillpad(reduce_raw, pad_value=pl.PadValue.zero), 8, QUANT_REDUCE_TILE)
-                    reduce_value = pl.cast(reduce_padded, pl.FP32)
-                    tmp = pl.create_tile([8, QUANT_REDUCE_TILE], dtype=pl.FP32)
-                    local_maximum = pl.reshape(pl.row_max(pl.abs(reduce_value), tmp_tile=tmp), [1, 8])
-                    maximum = pl.maximum(maximum, local_maximum)
-                factor = pl.reshape(pl.maximum(pl.mul(maximum, 1.0 / 127.0), 1e-30), [8, 1])
-                scale = pl.store(factor, [row, 0], scale)
-                denominator = pl.reshape(pl.mul(pl.maximum(maximum, 127e-30), 1.0 / 128.0), [8, 1])
-                inverse = pl.recip(denominator)
-                for k0 in pl.range(0, width, 256):
-                    _encode_checkpoint_panel(source, payload, row, k0, rows, denominator, inverse)
-    return payload, scale
-
-
-@pl.jit.inline(auto_scope=False)
-def quantize_activation(source: pl.Tensor, num_tokens: pl.Scalar[pl.INT32], width: pl.constexpr):
-    """Quantize A3 checkpoint activations using the matching width and row schedule."""
-    return quantize_projection_activation(source, num_tokens, width, True)
-
-
-def make_dynamic_int8_quantize(capacity: int, width: int):
-    """Build a PyPTO kernel for BF16 to INT8 per-token quantization.
-
-    The scale uses the vLLM/A2/A3 contract directly: one FP32 dequantization
-    scale per token, stored as ``[T, 1]``.
-    """
-
-    if capacity % 8 or width % K_TILE:
-        raise ValueError("capacity must be divisible by 8 and width by 256")
-
-    @pl.jit.inline
-    def quantize(
-        value: pl.Tensor[[capacity, width], pl.BF16],
-        payload: pl.Tensor[[capacity, width], pl.INT8],
-        scales: pl.Tensor[[capacity, 1], pl.FP32],
-        active: pl.Scalar[pl.INT32],
-    ):
-        for block in pl.spmd(capacity // 8, name_hint="dsv41_a2a3_dynamic_quant"):
-            t0 = block * 8
-            maximum = pl.full([1, 8], dtype=pl.FP32, value=INT8_AMAX_EPS)
-            for k0 in pl.range(0, width, K_TILE):
-                source = pl.slice(value, [8, K_TILE], [t0, k0])
-                maximum = pl.maximum(
-                    maximum, pl.reshape(pl.row_max(pl.abs(pl.cast(source, pl.FP32))), [1, 8])
-                )
-            inverse = pl.reshape(pl.div(pl.full([1, 8], dtype=pl.FP32, value=127.0), maximum), [8, 1])
-            scale = pl.reshape(pl.div(maximum, 127.0), [8, 1])
-            scales[t0 : t0 + 8, 0:1] = scale
-            for k0 in pl.range(0, width, K_TILE):
-                source_fp32 = pl.cast(pl.slice(value, [8, K_TILE], [t0, k0]), pl.FP32)
-                normalized = pl.row_expand_mul(source_fp32, inverse)
-                bounded = pl.minimum(pl.maximum(normalized, -127.0), 127.0)
-                rounded = pl.cast(bounded, pl.INT32, mode="rint")
-                payload[t0 : t0 + 8, k0 : k0 + K_TILE] = pl.cast(rounded, pl.INT8, mode="trunc")
-        return payload, scales
-
-    return quantize
-
-
-def make_decode_dynamic_int8_quantize(capacity: int, width: int, *, cann_dispatch: bool = False):
-    """Build a PyPTO kernel for BF16 to INT8 per-token quantization.
-
-    The scale uses the vLLM/A2/A3 contract directly: one FP32 dequantization
-    scale per token, stored as ``[T, 1]``.  CANN's fused dispatch path
-    uses FP16 truncation before its rounded INT8 store; other paths retain
-    the existing INT32 staging sequence.
-    """
-
-    if capacity % 8 or width % K_TILE:
-        raise ValueError("capacity must be divisible by 8 and width by 256")
-
-    @pl.jit.inline
-    def quantize(
-        value: pl.Tensor[[capacity, width], pl.BF16],
-        payload: pl.Tensor[[capacity, width], pl.INT8],
-        scales: pl.Tensor[[capacity, 1], pl.FP32],
-        active: pl.Scalar[pl.INT32],
-    ):
-        for block in pl.spmd(capacity // 8, name_hint="dsv41_a2a3_dynamic_quant"):
-            t0 = block * 8
-            maximum = pl.full([1, 8], dtype=pl.FP32, value=DECODE_INT8_AMAX_EPS)
-            for k0 in pl.range(0, width, K_TILE):
-                source = pl.slice(value, [8, K_TILE], [t0, k0])
-                maximum = pl.maximum(
-                    maximum, pl.reshape(pl.row_max(pl.abs(pl.cast(source, pl.FP32))), [1, 8])
-                )
-            inverse = pl.reshape(pl.div(pl.full([1, 8], dtype=pl.FP32, value=127.0), maximum), [8, 1])
-            scale = pl.reshape(pl.div(maximum, 127.0), [8, 1])
-            scales[t0 : t0 + 8, 0:1] = scale
-            for k0 in pl.range(0, width, K_TILE):
-                source_fp32 = pl.cast(pl.slice(value, [8, K_TILE], [t0, k0]), pl.FP32)
-                normalized = pl.row_expand_mul(source_fp32, inverse)
-                bounded = pl.minimum(pl.maximum(normalized, -127.0), 127.0)
-                if cann_dispatch:
-                    payload[t0 : t0 + 8, k0 : k0 + K_TILE] = pl.cast(
-                        pl.cast(bounded, target_type=pl.FP16, mode="trunc"),
-                        target_type=pl.INT8,
-                        mode="round",
-                    )
-                else:
-                    rounded = pl.cast(bounded, pl.INT32, mode="rint")
-                    payload[t0 : t0 + 8, k0 : k0 + K_TILE] = pl.cast(rounded, pl.INT8, mode="trunc")
-        return payload, scales
-
-    return quantize
-
-
-def make_cast_tile(rows, width, input_dtype, output_dtype):
-    """Select a typed identity or cross-dtype rounding conversion."""
-    if input_dtype == output_dtype:
-
-        @pl.jit.inline
-        def identity(value: pl.Tensor[[rows, width], input_dtype]):
-            return value
-
-        return identity
-
-    @pl.jit.inline
-    def cast_tile(value: pl.Tensor[[rows, width], input_dtype]):
-        return pl.cast(value, output_dtype, mode="rint")
-
-    return cast_tile
-
-
-def make_decode_cast_tile(rows, width, input_dtype, output_dtype):
-    """Choose identity or a rounding cast before the DSL parses either body."""
-    # PyPTO needs a concrete Tensor annotation while parsing an inline body.
-    # A closure over ``input_dtype`` is a Python value, so the generic
-    # annotation used here previously lost the tensor metadata during a full
-    # layer compile.  Keep the small set of dtypes used by the model explicit.
-    if input_dtype == pl.BF16 and output_dtype == pl.BF16:
-
-        @pl.jit.inline
-        def identity_bf16(value: pl.Tensor[[rows, width], pl.BF16]):
-            return value
-
-        return identity_bf16
-    if input_dtype == pl.BF16 and output_dtype == pl.FP32:
-
-        @pl.jit.inline
-        def cast_bf16_fp32(value: pl.Tensor[[rows, width], pl.BF16]):
-            return pl.cast(value, pl.FP32, mode="rint")
-
-        return cast_bf16_fp32
-    if input_dtype == pl.FP32 and output_dtype == pl.FP32:
-
-        @pl.jit.inline
-        def identity_fp32(value: pl.Tensor[[rows, width], pl.FP32]):
-            return value
-
-        return identity_fp32
-    if input_dtype == pl.FP32 and output_dtype == pl.BF16:
-
-        @pl.jit.inline
-        def cast_fp32_bf16(value: pl.Tensor[[rows, width], pl.FP32]):
-            return pl.cast(value, pl.BF16, mode="rint")
-
-        return cast_fp32_bf16
-    raise ValueError(f"unsupported cast tile dtypes: {input_dtype} -> {output_dtype}")
-
-
-def make_quantize_row(width, *, fused_requantize=False):
-    """Quantize one FP32 row with eight-segment maximum reduction."""
-    @pl.jit.inline
-    def quantize_row(value: pl.Tensor[[1, width], pl.FP32]):
-        segments = pl.reshape(pl.abs(value), [8, width // 8])
-        partial = pl.row_max(segments)
-        ones = pl.full([8, 8], dtype=pl.FP32, value=1.0)
-        repeated = pl.row_expand_mul(ones, partial)
-        maximum = pl.col_max(repeated)
-        if fused_requantize:
-            scale = pl.div(maximum, 127.0)
-            safe_scale = pl.maximum(scale, 1e-30)
-            inverse_row = pl.recip(safe_scale)
+        boundaries = (table[:-1] + table[1:]) * 0.5
+        absolute = magnitude.squeeze(-1)
+        if torch.any(absolute > table[-1]):
+            index = (magnitude - table).abs().argmin(dim=-1).to(torch.uint8)
         else:
-            scale = pl.mul(maximum, 1.0 / 127.0)
-            safe_maximum = pl.maximum(maximum, 1e-30)
-            numerator = pl.full([1, 8], dtype=pl.FP32, value=127.0)
-            inverse_row = pl.div(numerator, safe_maximum)
-        inverse = pl.read(inverse_row, [0, 0])
-        normalized = pl.mul(value, inverse)
-        if fused_requantize:
-            normalized_half = pl.cast(normalized, pl.FP16, mode="rint")
-            normalized = pl.cast(normalized_half, pl.FP32)
-        lower_bounded = pl.maximum(normalized, -127.0)
-        bounded = pl.minimum(lower_bounded, 127.0)
-        rounded = pl.cast(bounded, pl.INT32, mode="rint")
-        exact_half = pl.cast(rounded, pl.FP16, mode="rint")
-        codes = pl.cast(exact_half, pl.INT8, mode="trunc")
-        return codes, scale
-
-    return quantize_row
+            index = torch.bucketize(absolute, boundaries, out_int32=True).to(torch.uint8)
+            index.masked_fill_(~torch.isfinite(absolute), 0)
+    return index | (torch.signbit(values).to(torch.uint8) << 3)
 
 
-def make_quantize(
-    capacity, width, input_dtype=pl.BF16, *, rows_tile=VEC_M_TILE, fused_requantize=False, whole_row=False,
-):
-    """Specialize symmetric per-token INT8 quantization."""
-    if whole_row and width <= WHOLE_ROW_TILE:
-        if width % 8:
-            raise ValueError("Whole-row quantization requires eight equal reduction segments")
-        widen_row = make_cast_tile(1, width, input_dtype, pl.FP32)
-        quantize_row = make_quantize_row(width, fused_requantize=fused_requantize)
-
-        @pl.jit.inline
-        def quantize_whole_row(
-            x: pl.Tensor[[capacity, width], input_dtype],
-            payload: pl.Tensor[[capacity, width], pl.INT8],
-            scales: pl.Tensor[[capacity, 8], pl.FP32],
-            active: pl.Scalar[pl.INT32],
-        ):
-            for token in pl.spmd(active, name_hint="prefill_token_quantize_whole_row"):
-                source = pl.slice(x, [1, width], [token, 0], valid_shape=[1, width])
-                value = pl.create_tensor([1, width], dtype=pl.FP32)
-                value[:, :] = widen_row(source)
-                codes, scale = quantize_row(value)
-                scales[token : token + 1, :] = scale
-                payload[token : token + 1, :] = codes
-            return payload, scales
-
-        return quantize_whole_row
-
-    width_tile = min(K_TILE, width)
-    widen = make_cast_tile(rows_tile, width_tile, input_dtype, pl.FP32)
-
-    @pl.jit.inline
-    def quantize(
-        x: pl.Tensor[[capacity, width], input_dtype],
-        payload: pl.Tensor[[capacity, width], pl.INT8],
-        scales: pl.Tensor[[capacity, 8], pl.FP32],
-        active: pl.Scalar[pl.INT32],
-    ):
-        for block in pl.spmd((active + rows_tile - 1) // rows_tile, name_hint="a2_token_quantize"):
-            t0 = block * rows_tile
-            rows = pl.min(rows_tile, active - t0)
-            maximum_row = pl.full([1, rows_tile], dtype=pl.FP32, value=0.0)
-            for k0 in pl.range(0, width, width_tile):
-                source = pl.slice(x, [rows_tile, width_tile], [t0, k0], valid_shape=[rows, width_tile])
-                widened = widen(source)
-                value = pl.set_validshape(
-                    pl.fillpad(widened, pad_value=pl.PadValue.zero), rows_tile, width_tile
-                )
-                chunk_maximum = pl.reshape(pl.row_max(pl.abs(value)), [1, rows_tile])
-                maximum_row = pl.maximum(maximum_row, chunk_maximum)
-            maximum = pl.reshape(maximum_row, [rows_tile, 1])
-            if fused_requantize:
-                scale = pl.div(maximum, 127.0)
-            else:
-                scale = pl.mul(maximum, 1.0 / 127.0)
-            numerator = pl.full([1, rows_tile], dtype=pl.FP32, value=127.0)
-            safe_maximum_row = pl.maximum(maximum_row, 1e-30)
-            if fused_requantize:
-                safe_scale_row = pl.maximum(pl.reshape(scale, [1, rows_tile]), 1e-30)
-                inverse_row = pl.recip(safe_scale_row)
-            else:
-                inverse_row = pl.div(numerator, safe_maximum_row)
-            inverse = pl.reshape(inverse_row, [rows_tile, 1])
-            scale_rows = pl.full([rows_tile, 8], dtype=pl.FP32, value=1.0)
-            expanded_scale = pl.row_expand_mul(scale_rows, scale)
-            scales[t0 : t0 + rows_tile, :] = pl.set_validshape(expanded_scale, rows, 8)
-            for k0 in pl.range(0, width, width_tile):
-                source = pl.slice(x, [rows_tile, width_tile], [t0, k0], valid_shape=[rows, width_tile])
-                widened = widen(source)
-                value = pl.set_validshape(
-                    pl.fillpad(widened, pad_value=pl.PadValue.zero), rows_tile, width_tile
-                )
-                normalized = pl.row_expand_mul(value, inverse)
-                if fused_requantize:
-                    normalized_half = pl.cast(normalized, pl.FP16, mode="rint")
-                    normalized = pl.cast(normalized_half, pl.FP32)
-                bounded = pl.minimum(pl.maximum(normalized, -127.0), 127.0)
-                rounded = pl.cast(bounded, pl.INT32, mode="rint")
-                exact_half = pl.cast(rounded, pl.FP16, mode="rint")
-                codes = pl.cast(exact_half, pl.INT8, mode="trunc")
-                payload[t0 : t0 + rows_tile, k0 : k0 + width_tile] = pl.set_validshape(
-                    codes, rows, width_tile
-                )
-        return payload, scales
-
-    return quantize
+def _pack_fp4(indices: torch.Tensor) -> torch.Tensor:
+    if indices.shape[-1] % 2:
+        raise ValueError("packed FP4 requires an even logical last dimension")
+    pairs = indices.unflatten(-1, (-1, 2))
+    return pairs[..., 0] | (pairs[..., 1] << 4)
 
 
-def make_prefill_projection_quantize(capacity, width):
-    """Quantize contiguous groups of BF16 projection inputs to INT8."""
-    if capacity < 1024 or capacity % VEC_M_TILE or width not in (1280, 5120):
-        return make_quantize(capacity, width, whole_row=True)
-    if width == 1280:
-
-        @pl.jit.inline
-        def quantize_query(
-            x: pl.Tensor[[capacity, width], pl.BF16],
-            payload: pl.Tensor[[capacity, width], pl.INT8],
-            scales: pl.Tensor[[capacity, 8], pl.FP32],
-            active: pl.Scalar[pl.INT32],
-        ):
-            return _quantize_cached_rows(x, payload, scales, active, capacity, width, False)
-
-        return quantize_query
-
-    column_tile = 1280
-
-    @pl.jit.inline
-    def quantize(
-        x: pl.Tensor[[capacity, width], pl.BF16],
-        payload: pl.Tensor[[capacity, width], pl.INT8],
-        scales: pl.Tensor[[capacity, 8], pl.FP32],
-        active: pl.Scalar[pl.INT32],
-    ):
-        tiles = (active + VEC_M_TILE - 1) // VEC_M_TILE
-        workers = pl.min(tiles, PREFILL_QUANT_WORKERS)
-        for worker in pl.spmd(workers, name_hint="prefill_token_quantize_whole_row"):
-            start = worker * tiles // workers
-            end = (worker + 1) * tiles // workers
-            for block in pl.pipeline(start, end, stage=1):
-                token = block * VEC_M_TILE
-                rows = pl.min(VEC_M_TILE, active - token)
-                source = x[token : token + VEC_M_TILE, :]
-                peak = pl.full([1, VEC_M_TILE], dtype=pl.FP32, value=0.0)
-                for col in pl.range(0, width, column_tile):
-                    part = pl.cast(source[:, col : col + column_tile], pl.FP32)
-                    peak = pl.maximum(peak, pl.reshape(pl.row_max(pl.abs(part)), [1, VEC_M_TILE]))
-                numerator = pl.full([1, VEC_M_TILE], dtype=pl.FP32, value=127.0)
-                inverse = pl.reshape(pl.div(numerator, pl.maximum(peak, 1e-30)), [VEC_M_TILE, 1])
-                scale = pl.reshape(pl.mul(peak, 1.0 / 127.0), [VEC_M_TILE, 1])
-                ones = pl.full([VEC_M_TILE, 8], dtype=pl.FP32, value=1.0)
-                scales[token : token + VEC_M_TILE, :] = pl.set_validshape(pl.row_expand_mul(ones, scale), rows, 8)
-                for col in pl.range(0, width, column_tile):
-                    part = pl.cast(source[:, col : col + column_tile], pl.FP32)
-                    rounded = pl.cast(pl.row_expand_mul(part, inverse), pl.INT32, mode="rint")
-                    codes = pl.cast(rounded, pl.INT8, mode="trunc")
-                    payload[token : token + VEC_M_TILE, col : col + column_tile] = pl.set_validshape(codes, rows, column_tile)
-        return payload, scales
-
-    return quantize
+def _unpack_fp4(payload: torch.Tensor) -> torch.Tensor:
+    packed = payload.contiguous().view(torch.uint8)
+    indices = torch.stack((packed & 0x0F, (packed >> 4) & 0x0F), dim=-1).flatten(-2)
+    return FP4_VALUES.to(payload.device)[indices.to(torch.long)]
 
 
-def make_prefill_projection_quantize_entry(capacity, width):
-    """Compile the shared Prefill projection quantizer as a standalone leaf."""
-    quantize_projection = make_prefill_projection_quantize(capacity, width)
-
-    @pl.jit
-    def quant(
-        x: pl.Tensor[[capacity, width], pl.BF16],
-        payload: pl.InOut[pl.Tensor[[capacity, width], pl.INT8]],
-        scales: pl.InOut[pl.Tensor[[capacity, 8], pl.FP32]],
-        active: pl.Scalar[pl.INT32],
-    ):
-        quantize_projection(x, payload, scales, active)
-        return payload, scales
-
-    return quant
+def quantize_mxfp4_weight(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize output-major ``[..., N, K]`` weights to checkpoint MXFP4 carriers."""
+    if weight.shape[-1] % MX_GROUP:
+        raise ValueError("MXFP4 weights require K divisible by 32")
+    grouped = weight.float().unflatten(-1, (-1, MX_GROUP))
+    amax = grouped.abs().amax(dim=-1)
+    exponent = torch.ceil(torch.log2((amax / 6.0).clamp_min(2.0**-127)))
+    scale = torch.exp2(exponent.clamp(-127, 128))
+    normalized = (grouped / scale.unsqueeze(-1)).clamp(-6.0, 6.0)
+    payload = _pack_fp4(_nearest_fp4_indices(normalized).flatten(-2))
+    return payload, encode_e8m0(scale)
 
 
-def make_decode_quantize(capacity, width, input_dtype=pl.BF16):
-    """Specialize symmetric per-token INT8 quantization."""
-    if input_dtype == pl.FP32:
-
-        @pl.jit.inline
-        def quantize(
-            x: pl.Tensor[[capacity, width], pl.FP32],
-            payload: pl.Tensor[[capacity, width], pl.INT8],
-            scales: pl.Tensor[[capacity, 8], pl.FP32],
-            active: pl.Scalar[pl.INT32],
-        ):
-            for block in pl.spmd((active + VEC_M_TILE - 1) // VEC_M_TILE, name_hint="a2_token_quantize"):
-                t0 = block * VEC_M_TILE
-                rows = pl.min(VEC_M_TILE, active - t0)
-                maximum_row = pl.full([1, VEC_M_TILE], dtype=pl.FP32, value=1e-30)
-                for k0 in pl.range(0, width, K_TILE):
-                    source = pl.slice(x, [VEC_M_TILE, K_TILE], [t0, k0], valid_shape=[rows, K_TILE])
-                    source = pl.set_validshape(
-                        pl.fillpad(source, pad_value=pl.PadValue.zero), VEC_M_TILE, K_TILE
-                    )
-                    chunk_maximum = pl.reshape(pl.row_max(pl.abs(source)), [1, VEC_M_TILE])
-                    maximum_row = pl.maximum(maximum_row, chunk_maximum)
-                maximum = pl.reshape(maximum_row, [VEC_M_TILE, 1])
-                scale = pl.mul(maximum, 1.0 / 127.0)
-                numerator = pl.full([1, VEC_M_TILE], dtype=pl.FP32, value=127.0)
-                inverse_row = pl.div(numerator, maximum_row)
-                inverse = pl.reshape(inverse_row, [VEC_M_TILE, 1])
-                scale_rows = pl.full([VEC_M_TILE, 8], dtype=pl.FP32, value=1.0)
-                scales[t0 : t0 + VEC_M_TILE, :] = pl.row_expand_mul(scale_rows, scale)
-                for k0 in pl.range(0, width, K_TILE):
-                    source = pl.slice(x, [VEC_M_TILE, K_TILE], [t0, k0], valid_shape=[rows, K_TILE])
-                    source = pl.set_validshape(
-                        pl.fillpad(source, pad_value=pl.PadValue.zero), VEC_M_TILE, K_TILE
-                    )
-                    normalized = pl.row_expand_mul(source, inverse)
-                    bounded = pl.minimum(pl.maximum(normalized, -127.0), 127.0)
-                    rounded = pl.cast(bounded, pl.INT32, mode="rint")
-                    exact_half = pl.cast(rounded, pl.FP16, mode="rint")
-                    payload[t0 : t0 + VEC_M_TILE, k0 : k0 + K_TILE] = pl.cast(
-                        exact_half, pl.INT8, mode="trunc"
-                    )
-            return payload, scales
-
-        return quantize
-
-    @pl.jit.inline
-    def quantize(
-        x: pl.Tensor[[capacity, width], input_dtype],
-        payload: pl.Tensor[[capacity, width], pl.INT8],
-        scales: pl.Tensor[[capacity, 8], pl.FP32],
-        active: pl.Scalar[pl.INT32],
-    ):
-        for block in pl.spmd((active + VEC_M_TILE - 1) // VEC_M_TILE, name_hint="a2_token_quantize"):
-            t0 = block * VEC_M_TILE
-            rows = pl.min(VEC_M_TILE, active - t0)
-            maximum_row = pl.full([1, VEC_M_TILE], dtype=pl.FP32, value=1e-30)
-            for k0 in pl.range(0, width, K_TILE):
-                source = pl.slice(x, [VEC_M_TILE, K_TILE], [t0, k0], valid_shape=[rows, K_TILE])
-                source = pl.set_validshape(pl.fillpad(source, pad_value=pl.PadValue.zero), VEC_M_TILE, K_TILE)
-                value = pl.cast(source, pl.FP32, mode="rint")
-                chunk_maximum = pl.reshape(pl.row_max(pl.abs(value)), [1, VEC_M_TILE])
-                maximum_row = pl.maximum(maximum_row, chunk_maximum)
-            maximum = pl.reshape(maximum_row, [VEC_M_TILE, 1])
-            scale = pl.mul(maximum, 1.0 / 127.0)
-            numerator = pl.full([1, VEC_M_TILE], dtype=pl.FP32, value=127.0)
-            inverse_row = pl.div(numerator, maximum_row)
-            inverse = pl.reshape(inverse_row, [VEC_M_TILE, 1])
-            scale_rows = pl.full([VEC_M_TILE, 8], dtype=pl.FP32, value=1.0)
-            scales[t0 : t0 + VEC_M_TILE, :] = pl.row_expand_mul(scale_rows, scale)
-            for k0 in pl.range(0, width, K_TILE):
-                source = pl.slice(x, [VEC_M_TILE, K_TILE], [t0, k0], valid_shape=[rows, K_TILE])
-                source = pl.set_validshape(pl.fillpad(source, pad_value=pl.PadValue.zero), VEC_M_TILE, K_TILE)
-                value = pl.cast(source, pl.FP32, mode="rint")
-                normalized = pl.row_expand_mul(value, inverse)
-                bounded = pl.minimum(pl.maximum(normalized, -127.0), 127.0)
-                rounded = pl.cast(bounded, pl.INT32, mode="rint")
-                exact_half = pl.cast(rounded, pl.FP16, mode="rint")
-                payload[t0 : t0 + VEC_M_TILE, k0 : k0 + K_TILE] = pl.cast(exact_half, pl.INT8, mode="trunc")
-        return payload, scales
-
-    return quantize
+def quantize_mxfp8_cache(value: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize the last dimension to E4M3 payload and group-32 BF16 scales."""
+    if value.shape[-1] % MX_GROUP:
+        raise ValueError("MXFP8 cache width must be divisible by 32")
+    grouped = value.float().unflatten(-1, (-1, MX_GROUP))
+    amax = grouped.abs().amax(dim=-1).clamp_min(1e-4)
+    scale = (amax / 448.0).to(torch.bfloat16)
+    payload = (grouped / scale.float().unsqueeze(-1)).clamp(-448.0, 448.0)
+    return payload.flatten(-2).to(torch.float8_e4m3fn), scale
 
 
-def make_dequantize(capacity, output_width, combine_scales=False, channel_dtype=pl.FP32, *, reuse_workers=False):
-    """Apply channel-first or combined scales with the selected channel rounding."""
-    if reuse_workers and not combine_scales and channel_dtype == pl.FP32 and output_width == 5120:
-        column_tile = 1280
-
-        @pl.jit.inline
-        def dequantize_shared(
-            accumulator: pl.Tensor[[capacity, output_width], pl.INT32],
-            channel_scale: pl.Tensor[[output_width], pl.FP32],
-            token_scale: pl.Tensor[[capacity, 8], pl.FP32],
-            output: pl.Tensor[[capacity, output_width], pl.BF16],
-            active: pl.Scalar[pl.INT32],
-        ):
-            tiles = (active + VEC_M_TILE - 1) // VEC_M_TILE
-            groups = pl.min(48 // (output_width // column_tile), tiles)
-            for worker in pl.spmd(groups * (output_width // column_tile), name_hint="shared_down_dequant_stream"):
-                column = worker % (output_width // column_tile) * column_tile
-                group = worker // (output_width // column_tile)
-                channels = pl.reshape(channel_scale[column : column + column_tile], [1, column_tile])
-                begin = group * tiles // groups
-                end = (group + 1) * tiles // groups
-                for block in pl.range(begin, end):
-                    token = block * VEC_M_TILE
-                    rows = pl.min(VEC_M_TILE, active - token)
-                    integer = accumulator[token : token + VEC_M_TILE, column : column + column_tile]
-                    value = pl.col_expand_mul(pl.cast(integer, pl.FP32, mode="rint"), channels)
-                    scale = pl.row_min(token_scale[token : token + VEC_M_TILE, :])
-                    result = pl.cast(pl.row_expand_mul(value, scale), pl.BF16, mode="rint")
-                    narrowed = pl.set_validshape(result, rows, column_tile)
-                    output[token : token + VEC_M_TILE, column : column + column_tile] = narrowed
-            return output
-
-        return dequantize_shared
-
-    column_tile = 1280 if output_width == 5120 else 1024
-    while column_tile > N_TILE and output_width % column_tile:
-        column_tile //= 2
-    narrow_channel = make_cast_tile(VEC_M_TILE, column_tile, pl.FP32, channel_dtype)
-    widen_channel = make_cast_tile(VEC_M_TILE, column_tile, channel_dtype, pl.FP32)
-
-    @pl.jit.inline
-    def dequantize(
-        accumulator: pl.Tensor[[capacity, output_width], pl.INT32],
-        channel_scale: pl.Tensor[[output_width], pl.FP32],
-        token_scale: pl.Tensor[[capacity, 8], pl.FP32],
-        output: pl.Tensor[[capacity, output_width], pl.BF16],
-        active: pl.Scalar[pl.INT32],
-    ):
-        row_blocks = (active + VEC_M_TILE - 1) // VEC_M_TILE
-        for block in pl.spmd(row_blocks * (output_width // column_tile), name_hint="a2_dequantize"):
-            t0 = (block // (output_width // column_tile)) * VEC_M_TILE
-            n0 = (block % (output_width // column_tile)) * column_tile
-            rows = pl.min(VEC_M_TILE, active - t0)
-            integer = accumulator[t0 : t0 + VEC_M_TILE, n0 : n0 + column_tile]
-            value = pl.cast(integer, pl.FP32, mode="rint")
-            channels = pl.reshape(channel_scale[n0 : n0 + column_tile], [1, column_tile])
-            scale = pl.row_min(token_scale[t0 : t0 + VEC_M_TILE, :])
-            if combine_scales:
-                ones = pl.full([VEC_M_TILE, column_tile], dtype=pl.FP32, value=1.0)
-                channel_rows = pl.col_expand_mul(ones, channels)
-                combined = pl.row_expand_mul(channel_rows, scale)
-                scaled = pl.mul(value, combined)
-            else:
-                scaled_channels = pl.create_tensor([VEC_M_TILE, column_tile], dtype=pl.FP32)
-                scaled_channels[:, :] = pl.col_expand_mul(value, channels)
-                rounded_channels = pl.create_tensor([VEC_M_TILE, column_tile], dtype=channel_dtype)
-                rounded_channels[:, :] = narrow_channel(scaled_channels)
-                channel_fp32 = widen_channel(rounded_channels)
-                scaled = pl.row_expand_mul(channel_fp32, scale)
-            narrowed = pl.cast(scaled, pl.BF16, mode="rint")
-            output[t0 : t0 + VEC_M_TILE, n0 : n0 + column_tile] = pl.set_validshape(narrowed, rows, column_tile)
-        return output
-
-    return dequantize
+def dequantize_mxfp8_cache(payload: torch.Tensor, scale_bf16: torch.Tensor) -> torch.Tensor:
+    """Decode an MXFP8 cache tensor whose groups lie on the last dimension."""
+    scales = scale_bf16.float().repeat_interleave(MX_GROUP, dim=-1)
+    return payload.float() * scales
 
 
-def make_decode_dequantize(capacity, output_width, combine_scales=False, output_dtype=pl.BF16):
-    """Apply the selected native FP32 scale boundary to INT32 products.
-
-    The native per-token optimized kernel combines channel/token scales before
-    multiplying the accumulator. Other native kernels scale channel-first.
-    Callers select their source boundary explicitly; QKV keeps its existing ABI.
-    """
-    if output_dtype == pl.FP32:
-
-        @pl.jit.inline
-        def dequantize(
-            accumulator: pl.Tensor[[capacity, output_width], pl.INT32],
-            channel_scale: pl.Tensor[[output_width], pl.FP32],
-            token_scale: pl.Tensor[[capacity, 8], pl.FP32],
-            output: pl.Tensor[[capacity, output_width], pl.FP32],
-            active: pl.Scalar[pl.INT32],
-        ):
-            row_blocks = (active + VEC_M_TILE - 1) // VEC_M_TILE
-            for block in pl.spmd(row_blocks * (output_width // N_TILE), name_hint="a2_dequantize_fp32"):
-                t0 = (block // (output_width // N_TILE)) * VEC_M_TILE
-                n0 = (block % (output_width // N_TILE)) * N_TILE
-                rows = pl.min(VEC_M_TILE, active - t0)
-                integer = accumulator[t0 : t0 + VEC_M_TILE, n0 : n0 + N_TILE]
-                value = pl.cast(integer, pl.FP32, mode="rint")
-                channels = pl.reshape(channel_scale[n0 : n0 + N_TILE], [1, N_TILE])
-                scale = pl.row_min(token_scale[t0 : t0 + VEC_M_TILE, :])
-                if combine_scales:
-                    ones = pl.full([VEC_M_TILE, N_TILE], dtype=pl.FP32, value=1.0)
-                    channel_rows = pl.col_expand_mul(ones, channels)
-                    combined = pl.row_expand_mul(channel_rows, scale)
-                    scaled = pl.mul(value, combined)
-                else:
-                    scaled_channels = pl.col_expand_mul(value, channels)
-                    scaled = pl.row_expand_mul(scaled_channels, scale)
-                output[t0 : t0 + VEC_M_TILE, n0 : n0 + N_TILE] = pl.set_validshape(scaled, rows, N_TILE)
-            return output
-
-        return dequantize
-
-    @pl.jit.inline
-    def dequantize(
-        accumulator: pl.Tensor[[capacity, output_width], pl.INT32],
-        channel_scale: pl.Tensor[[output_width], pl.FP32],
-        token_scale: pl.Tensor[[capacity, 8], pl.FP32],
-        output: pl.Tensor[[capacity, output_width], pl.BF16],
-        active: pl.Scalar[pl.INT32],
-    ):
-        row_blocks = (active + VEC_M_TILE - 1) // VEC_M_TILE
-        for block in pl.spmd(row_blocks * (output_width // N_TILE), name_hint="a2_dequantize"):
-            t0 = (block // (output_width // N_TILE)) * VEC_M_TILE
-            n0 = (block % (output_width // N_TILE)) * N_TILE
-            rows = pl.min(VEC_M_TILE, active - t0)
-            integer = accumulator[t0 : t0 + VEC_M_TILE, n0 : n0 + N_TILE]
-            value = pl.cast(integer, pl.FP32, mode="rint")
-            channels = pl.reshape(channel_scale[n0 : n0 + N_TILE], [1, N_TILE])
-            scale = pl.row_min(token_scale[t0 : t0 + VEC_M_TILE, :])
-            if combine_scales:
-                ones = pl.full([VEC_M_TILE, N_TILE], dtype=pl.FP32, value=1.0)
-                channel_rows = pl.col_expand_mul(ones, channels)
-                combined = pl.row_expand_mul(channel_rows, scale)
-                scaled = pl.mul(value, combined)
-            else:
-                scaled_channels = pl.col_expand_mul(value, channels)
-                scaled = pl.row_expand_mul(scaled_channels, scale)
-            narrowed = pl.cast(scaled, pl.BF16, mode="rint")
-            output[t0 : t0 + VEC_M_TILE, n0 : n0 + N_TILE] = pl.set_validshape(narrowed, rows, N_TILE)
-        return output
-
-    return dequantize
-
-
-def _round_symmetric_int8(value: torch.Tensor) -> torch.Tensor:
-    rounded = torch.round(value).clamp(-CONTRACT.int8_scale_max, CONTRACT.int8_scale_max)
-    return rounded.to(torch.int32).to(torch.float16).to(torch.int8)
-
-
-def quantize_per_token_int8(
-    value: torch.Tensor,
-    smooth_scale: torch.Tensor | None = None,
+def quantize_mxfp4_cache(
+    value: torch.Tensor, group_size: int, scale_format: str, *, round_to_even: bool = False
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Quantize each row to INT8 and return an FP32 dequant scale.
-
-    This mirrors ``torch_npu.npu_dynamic_quant`` used by
-    ``AscendW8A8DynamicLinearMethod``.  The returned scale has a trailing
-    singleton dimension and is suitable for broadcasting over the row.
-    """
-
-    source = value.float()
-    if smooth_scale is not None:
-        source = source * smooth_scale.float()
-    amax = source.abs().amax(dim=-1, keepdim=True).clamp_min(CONTRACT.int8_amax_epsilon)
-    dequant_scale = amax / CONTRACT.int8_scale_max
-    payload = _round_symmetric_int8(source / dequant_scale)
-    return payload, dequant_scale
-
-
-def quantize_per_channel_int8(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Quantize an output-major ``[N, K]`` weight with FP32 channel scales."""
-
-    source = weight.float()
-    amax = source.abs().amax(dim=-1, keepdim=True).clamp_min(CONTRACT.int8_amax_epsilon)
-    dequant_scale = amax / CONTRACT.int8_scale_max
-    payload = _round_symmetric_int8(source / dequant_scale)
-    return payload, dequant_scale
+    """Quantize the last dimension to packed E2M1 with E4M3, E8M0 or BF16 scales."""
+    if value.shape[-1] % group_size:
+        raise ValueError(f"MXFP4 cache width must be divisible by {group_size}")
+    grouped = value.float().unflatten(-1, (-1, group_size))
+    amax = grouped.abs().amax(dim=-1)
+    floor = 2.0**-126 if round_to_even and scale_format == "e8m0" else 2.0**-9
+    raw_scale = (amax / 6.0).clamp_min(floor)
+    if scale_format == "e8m0":
+        exponent = torch.ceil(torch.log2(raw_scale)).clamp(-127, 128)
+        scale_value = torch.exp2(exponent)
+        stored_scale = encode_e8m0(scale_value)
+    elif scale_format == "e4m3":
+        stored_scale = raw_scale.clamp(max=448.0).to(torch.float8_e4m3fn)
+        scale_value = stored_scale.float()
+    elif scale_format == "bf16":
+        stored_scale = raw_scale.to(torch.bfloat16)
+        scale_value = stored_scale.float()
+    else:
+        raise ValueError(f"unsupported MXFP4 cache scale format {scale_format!r}")
+    normalized = (grouped / scale_value.unsqueeze(-1)).clamp(-6.0, 6.0)
+    payload = _pack_fp4(_nearest_fp4_indices(normalized, round_to_even=round_to_even).flatten(-2))
+    return payload, stored_scale
 
 
-def decode_quantize_per_token_int8(value: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Mirror the FP32 division and rounding order of ``make_decode_quantize``.
-
-    Both BF16 and FP32 inputs use ``x * (127 / amax)`` before nearest-even
-    conversion. Dividing by the dequant scale can cross an INT8 half-integer
-    boundary because its FP32 intermediates differ from the device path.
-    """
-    source = value.float()
-    maximum = source.abs().amax(dim=-1, keepdim=True).clamp_min(1e-30)
-    dequant_scale = maximum * (1.0 / CONTRACT.int8_scale_max)
-    inverse = torch.div(torch.full_like(maximum, CONTRACT.int8_scale_max), maximum)
-    payload = _round_symmetric_int8(source * inverse)
-    return payload, dequant_scale
-
-
-def int8_matmul(value: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-    """Compute ``[..., K] @ [N, K].T`` with an INT32 accumulator."""
-
-    if value.shape[-1] != weight.shape[-1]:
-        raise ValueError(f"K mismatch: activation={value.shape[-1]}, weight={weight.shape[-1]}")
-    if value.shape[-1] % CONTRACT.int8_k_alignment:
-        raise ValueError(
-            f"A2/A3 INT8 GEMM requires K aligned to {CONTRACT.int8_k_alignment}, got {value.shape[-1]}"
-        )
-    return torch.matmul(value.to(torch.int32), weight.to(torch.int32).transpose(-2, -1))
-
-
-def dequantize_int32(
-    accumulator: torch.Tensor,
-    token_scale: torch.Tensor,
-    channel_scale: torch.Tensor,
-    out_dtype: torch.dtype = torch.bfloat16,
+def dequantize_mxfp4_cache(
+    payload: torch.Tensor,
+    scale: torch.Tensor,
+    group_size: int,
+    scale_format: str,
 ) -> torch.Tensor:
-    """Apply FP32 token/channel scales after INT32 accumulation."""
+    """Decode a packed E2M1 cache tensor with last-dimension MX groups."""
+    if scale_format == "e8m0":
+        scale_value = decode_e8m0(scale)
+    elif scale_format in ("e4m3", "bf16"):
+        scale_value = scale.float()
+    else:
+        raise ValueError(f"unsupported MXFP4 cache scale format {scale_format!r}")
+    scales = scale_value.repeat_interleave(group_size, dim=-1)
+    return _unpack_fp4(payload) * scales
 
-    result = accumulator.float() * token_scale.float()
-    result = result * channel_scale.float().reshape(*([1] * (result.ndim - 1)), -1)
-    return result.to(out_dtype)
+
+def _quantize_mxfp8_activation(
+    x: torch.Tensor, *, scale_alg: int = 1
+) -> tuple[torch.Tensor, torch.Tensor]:
+    *leading, width = x.shape
+    if width % MX_GROUP:
+        raise ValueError("MXFP8 activations require the last dimension to be divisible by 32")
+    grouped = x.float().reshape(*leading, width // MX_GROUP, MX_GROUP)
+    amax = grouped.abs().amax(dim=-1)
+    if scale_alg == 0:
+        # npu_dynamic_mx_quant defaults to OCP: floor(log2(amax)) - 8.
+        codes = _ocp_e8m0_codes_from_amax(amax)
+        scale = decode_e8m0(codes)
+        reciprocal = torch.where(codes > 0, torch.exp2(127.0 - codes.float()), 0.0)
+        normalized = grouped * reciprocal.unsqueeze(-1)
+    elif scale_alg == 1:
+        scale = torch.exp2(torch.ceil(torch.log2(amax.clamp_min(1e-4) / 448.0)))
+        normalized = grouped / scale.unsqueeze(-1)
+    else:
+        raise ValueError("MXFP8 scale_alg must be 0 (OCP) or 1 (upward)")
+    quantized = normalized.clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+    return quantized, scale
 
 
-def w8a8_linear(
-    value: torch.Tensor,
-    weight: torch.Tensor,
-    weight_scale: torch.Tensor,
-    bias: torch.Tensor | None = None,
-    smooth_scale: torch.Tensor | None = None,
-    out_dtype: torch.dtype = torch.bfloat16,
-) -> torch.Tensor:
-    """Reference for dynamic W8A8 linear on A2/A3."""
+def quantize_mxfp8_upward_reference(value):
+    """Independent translation of official kernel.py act_quant_kernel, group size 32."""
+    groups = value.float().unflatten(-1, (-1, MX_GROUP))
+    maximum = groups.abs().amax(-1).clamp_min(1e-4)
+    exponent = torch.ceil(torch.log2(maximum * (1.0 / 448.0)))
+    scale = torch.pow(2.0, exponent)
+    payload = (groups / scale[..., None]).clamp(-448, 448).to(torch.float8_e4m3fn).flatten(-2)
+    return payload, (exponent + 127).to(torch.uint8)
 
-    payload, token_scale = quantize_per_token_int8(value, smooth_scale)
-    accumulator = int8_matmul(payload, weight)
-    result = dequantize_int32(accumulator, token_scale, weight_scale, out_dtype)
-    if bias is not None:
-        result = (result.float() + bias.float()).to(out_dtype)
-    return result
+
+def quantize_grouped_mxfp8_weight(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize grouped fixtures into NZ bytes with logical [..., G, K, N] shape."""
+    payload, scale = _quantize_mxfp8_activation(weight)
+    payload = payload.flatten(-2).transpose(-1, -2).contiguous()
+    codes = encode_e8m0(scale).transpose(-1, -2).contiguous()
+    return pack_fp8_nz(payload), pack_mx_b_scale(codes).view(torch.float8_e8m0fnu)
+
+
+# E8M0 has no native dtype in some PyTorch versions, so it is always carried as uint8.
+FP8_E4M3_MAX = 448.0
+
+def _ocp_e8m0_codes_from_amax(amax: torch.Tensor) -> torch.Tensor:
+    """Compute OCP shared-exponent codes for activations and random weight fixtures."""
+    _, exponent = torch.frexp(amax.float())
+    codes = exponent.to(torch.int32) - 1 - 8 + 127
+    codes = codes.clamp(0, 255)
+    return torch.where(amax == 0, torch.zeros_like(codes), codes).to(torch.uint8)
+
+
+def pack_mx_a_scale(scale: torch.Tensor) -> torch.Tensor:
+    """Return the A3 logical ND carrier layout."""
+    return scale.contiguous()
+
+
+def unpack_mx_a_scale(scale: torch.Tensor) -> torch.Tensor:
+    """Return the A3 logical ND carrier layout."""
+    return scale.contiguous()
+
+
+def quantize_mxfp8_upward_e8m0(
+    x: torch.Tensor
+):
+    """Match the released group-32 MXFP8 quantization and upward scale."""
+    value = x.float()
+    groups = value.reshape(*value.shape[:-1], -1, MX_GROUP)
+    maximum = groups.abs().amax(dim=-1).clamp_min(1e-4)
+    # Double precision keeps a one-ULP excess above a power of two from
+    # rounding back onto the boundary before ceil.
+    scale_exponent = torch.ceil(
+        torch.log2((maximum * (1.0 / FP8_E4M3_MAX)).double())
+    ).to(torch.int32)
+    scale = torch.exp2(scale_exponent).float()
+    payload = (
+        (groups / scale.unsqueeze(-1))
+        .clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX)
+        .to(torch.float8_e4m3fn)
+        .reshape_as(value)
+    )
+    codes = (scale_exponent + 127).to(torch.uint8)
+    return payload, codes
+
+
+def generate_mxfp8_weight_kn(out: int, inn: int, dequant_std: float, *, chan_cv: float = 0.5, seed: int = 0):
+    """Generate MXFP8 weights in the device K-N layout with packed E8M0 scales."""
+    g = torch.Generator().manual_seed(seed)
+    raw = torch.randn(out, inn, generator=g) * torch.exp(chan_cv * torch.randn(out, 1, generator=g))
+    groups = raw.reshape(out, inn // MX_GROUP, MX_GROUP)
+    codes = _ocp_e8m0_codes_from_amax(groups.abs().amax(-1))
+    scale = decode_e8m0(codes)
+    quantized = (groups / scale.unsqueeze(-1)).clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX).to(torch.float8_e4m3fn)
+    data_kn = quantized.reshape(out, inn).transpose(0, 1).contiguous()
+    codes_kn = codes.transpose(0, 1).contiguous()
+    decoded = data_kn.float() * decode_e8m0(codes_kn).repeat_interleave(MX_GROUP, dim=0)
+    gain = dequant_std / decoded.float().std().clamp_min(1e-8)
+    shift = int(torch.round(torch.log2(gain)).item())
+    codes_kn = (codes_kn.to(torch.int32) + shift).clamp(0, 255).to(torch.uint8)
+    scale_e8m0 = pack_mx_b_scale(codes_kn).contiguous()
+    e8m0 = getattr(torch, "float8_e8m0fnu", None)
+    if e8m0 is not None:
+        scale_e8m0 = scale_e8m0.view(e8m0)
+    return data_kn, scale_e8m0
+
+
+def unpack_mx_scale_codes(scale: torch.Tensor, *, side: str = "a") -> torch.Tensor:
+    """Recover logical E8M0 codes from an A-ZZ/B-NN physical scale backing."""
+    codes = scale.contiguous().view(torch.uint8)
+    if side == "a":
+        return unpack_mx_a_scale(codes)
+    if side == "b":
+        return unpack_mx_b_scale(codes)
+    raise ValueError(f"side must be 'a' or 'b', got {side!r}")
+
+
+@pl.jit
+def validate_codecs(
+    source: pl.Tensor[[16, 256], pl.FP32],
+    fp4_source: pl.Tensor[[16, 256], pl.FP32],
+    fp4_factors: pl.Tensor[[16, 1], pl.FP32],
+    fp8: pl.Tensor[[16, 256], pl.UINT8],
+    fp4: pl.Tensor[[16, 128], pl.UINT8],
+    scales: pl.Tensor[[16, 256], pl.UINT8],
+    encoded: pl.Out[pl.Tensor[[16, 256], pl.UINT8]],
+    encoded_fp4: pl.Out[pl.Tensor[[16, 128], pl.UINT8]],
+    decoded_fp8: pl.Out[pl.Tensor[[16, 256], pl.BF16]],
+    decoded_fp4: pl.Out[pl.Tensor[[16, 256], pl.BF16]],
+    decoded_scales: pl.Out[pl.Tensor[[16, 256], pl.FP32]],
+):
+    """Validate the finite cache code space and FP8 midpoint rounding."""
+    with pl.spmd(1, name_hint="validate_cache_codecs"):
+        _block = pl.tile.get_block_idx()
+        value = pl.load(source, [0, 0], [16, 256])
+        result = encode_fp8(value, 16, 256)
+        encoded = pl.store(result, [0, 0], encoded)
+        fp4_values = pl.load(fp4_source, [0, 0], [16, 256])
+        fp4_scales = pl.load(fp4_factors, [0, 0], [16, 1])
+        fp4_result = pl.reshape(encode_fp4(fp4_values, fp4_scales, 16, 256), [16, 128])
+        encoded_fp4 = pl.store(fp4_result, [0, 0], encoded_fp4)
+        raw_fp8 = pl.load(fp8, [0, 0], [16, 256])
+        value_fp8 = decode_fp8(raw_fp8, 16, 256)
+        decoded_fp8 = pl.store(value_fp8, [0, 0], decoded_fp8)
+        raw_fp4 = pl.load(fp4, [0, 0], [16, 128])
+        value_fp4 = decode_fp4(raw_fp4, 16, 256)
+        decoded_fp4 = pl.store(value_fp4, [0, 0], decoded_fp4)
+        raw_scales = pl.load(scales, [0, 0], [16, 256])
+        value_scales = decode_scale(raw_scales, 16, 256)
+        decoded_scales = pl.store(value_scales, [0, 0], decoded_scales)
+    return encoded, encoded_fp4, decoded_fp8, decoded_fp4, decoded_scales
+
+
+if __name__ == "__main__":
+    import argparse
+    from golden import TensorSpec, ratio_allclose, run
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("-p", "--platform", choices=["a2a3"], default="a2a3")
+    parser.add_argument("-d", "--device", type=int, default=0)
+    parser.add_argument("--sim", action="store_true")
+    parser.add_argument("--compile-only", action="store_true")
+    args = parser.parse_args()
+    codes = torch.arange(256, dtype=torch.uint8)
+    finite_codes = codes[(codes & 127) != 127]
+    positive = codes[:127].view(torch.float8_e4m3fn).float()
+    midpoints = (positive[1:] + positive[:-1]) * 0.5
+    lower = torch.nextafter(midpoints, torch.full_like(midpoints, -float("inf")))
+    upper = torch.nextafter(midpoints, torch.full_like(midpoints, float("inf")))
+    boundaries = torch.cat((midpoints, lower, upper))
+    values = torch.cat((finite_codes.view(torch.float8_e4m3fn).float(), boundaries, -boundaries))
+    values = torch.cat((values, torch.tensor([-1000.0, 1000.0, -0.0, 0.0])))
+    source = values.repeat((4096 + values.numel() - 1) // values.numel())[:4096].reshape(16, 256)
+    fp8 = finite_codes.repeat((4096 + finite_codes.numel() - 1) // finite_codes.numel())[:4096].reshape(16, 256)
+    fp4 = codes.repeat(8).reshape(16, 128)
+    scales = codes[:255].repeat(17)[:4096].reshape(16, 256)
+    fp4_factors = torch.tensor([0.001953125, 0.11328125, 0.12109375, 1.5]).repeat(4).reshape(16, 1)
+    fp4_midpoints = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0])
+    fp4_midpoints = fp4_midpoints.repeat(37)[:256].unsqueeze(0) * fp4_factors
+    fp4_below = torch.nextafter(fp4_midpoints, torch.full_like(fp4_midpoints, -float("inf")))
+    fp4_above = torch.nextafter(fp4_midpoints, torch.full_like(fp4_midpoints, float("inf")))
+    fp4_source = torch.stack((fp4_midpoints, fp4_below, fp4_above, -fp4_midpoints), dim=-1)
+    fp4_source = fp4_source.flatten(1)[:, :256].contiguous()
+    fp4_source[:, :2] = torch.tensor([0.0, -0.0])
+
+    def golden(tensors):
+        tensors["encoded"].copy_(tensors["source"].clamp(-448, 448).to(torch.float8_e4m3fn).view(torch.uint8))
+        normalized = tensors["fp4_source"].double() / tensors["fp4_factors"].double()
+        tensors["encoded_fp4"].copy_(_pack_fp4(_nearest_fp4_indices(normalized, round_to_even=True)))
+        tensors["decoded_fp8"].copy_(tensors["fp8"].view(torch.float8_e4m3fn).bfloat16())
+        tensors["decoded_fp4"].copy_(_unpack_fp4(tensors["fp4"]).bfloat16())
+        tensors["decoded_scales"].copy_(torch.exp2(tensors["scales"].float() - 127.0))
+
+    inputs = [("source", source), ("fp4_source", fp4_source), ("fp4_factors", fp4_factors),
+              ("fp8", fp8), ("fp4", fp4), ("scales", scales)]
+    specs = [TensorSpec(name, list(value.shape), value.dtype, init_value=value) for name, value in inputs]
+    output_types = {"encoded": torch.uint8, "encoded_fp4": torch.uint8, "decoded_fp8": torch.bfloat16,
+                    "decoded_fp4": torch.bfloat16, "decoded_scales": torch.float32}
+    specs.extend(TensorSpec(name, [16, 128 if name == "encoded_fp4" else 256], dtype)
+                 for name, dtype in output_types.items())
+    result = run(
+        fn=validate_codecs,
+        specs=specs,
+        golden_fn=golden,
+        compare_fn={name: ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.0) for name in output_types},
+        config={"backend_type": args.platform, "execution_mode": args.sim, "device_id": args.device},
+        compile_only=args.compile_only,
+    )
+    if not result.passed:
+        raise SystemExit(result.error or 1)
+
+
+def mapped_fp4_cache_compare(
+    mapping_name: str,
+    *,
+    mapping_shape: tuple[int, ...],
+    block_size: int,
+    pool_name: str,
+    leading_rank_axis: bool = False,
+    max_error_ratio: float = 0.005,
+):
+    """Bound sparse E2M1 changes after floating-point model computation.
+
+    The existing mapped comparator keeps every unwritten byte exact and bounds
+    differing written bytes by the declared ratio. A second, unconditional gate
+    rejects sign changes (including signed zero) or a jump over more than one
+    magnitude level in either nibble. This is an end-to-end numerical policy,
+    not an exact quantizer test or a proof of a floating-point error bound.
+    """
+    from golden import mapped_pool_ratio_allclose
+
+    mapped = mapped_pool_ratio_allclose(
+        mapping_name, mapping_shape=mapping_shape, block_size=block_size,
+        leading_rank_axis=leading_rank_axis, pool_name=pool_name,
+        atol=0.0, rtol=0.0, max_error_ratio=max_error_ratio,
+    )
+
+    def compare(actual, expected, **kwargs):
+        if actual.dtype != torch.uint8 or expected.dtype != torch.uint8:
+            return False, f"{pool_name}: packed E2M1 payload must have UINT8 storage"
+        ok, detail = mapped(actual, expected, **kwargs)
+        if not ok:
+            return False, detail
+        a = actual.detach().cpu().to(torch.int16)
+        e = expected.detach().cpu().to(torch.int16)
+        sign_changed = torch.bitwise_and(torch.bitwise_xor(a, e), 0x88) != 0
+        if bool(sign_changed.any()):
+            return False, f"{pool_name}: E2M1 sign changed in {int(sign_changed.sum())} byte(s)"
+        low_distance = ((a & 7) - (e & 7)).abs()
+        high_distance = (((a >> 4) & 7) - ((e >> 4) & 7)).abs()
+        invalid = (low_distance > 1) | (high_distance > 1)
+        if bool(invalid.any()):
+            return False, f"{pool_name}: E2M1 magnitude skips a level in {int(invalid.sum())} byte(s)"
+        return True, ""
+
+    return compare

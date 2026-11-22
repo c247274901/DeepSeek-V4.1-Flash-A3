@@ -13,12 +13,12 @@ from typing import Mapping, Sequence
 
 import torch
 
-from .operators import config as C
-from .operators.config import FLASH as M
-from .operators.engram import ENGRAM_K, HostEngram
-from .operators.rope_tables import prepare_forward_rope_tables
-from .operators.utils import paged_slots, window_metadata
-from .operators.weights import ResidentWeights
+from . import config as C
+from .config import FLASH as M
+from .engram import ENGRAM_K, HostEngram
+from .rope_tables import prepare_forward_rope_tables
+from .utils import paged_slots, window_metadata
+from .weights import ResidentWeights
 
 
 def prepare_prefill_inputs(

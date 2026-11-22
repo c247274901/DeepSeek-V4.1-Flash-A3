@@ -24,19 +24,19 @@ import torch
 import torch.nn.functional as F
 from tokenizers import Tokenizer
 
-from .operators.config import FLASH as M
-from .operators.compressor import golden_c1a_compressor, golden_c2a_compressor
-from .operators.engram import HostEngram, golden_engram
-from .operators.gate import golden_gate_reference
-from .operators.gemm import golden_activation_int8
-from .operators.hc import golden_hc_collapse, golden_hc_post, golden_mhc_mixes
+from .config import FLASH as M
+from .compressor import golden_c1a_compressor, golden_c2a_compressor
+from .engram import HostEngram, golden_engram
+from .gate import golden_gate_reference
+from .gemm import golden_activation_int8
+from .hc import golden_hc_collapse, golden_hc_post, golden_mhc_mixes
 from .host import prepare_prefill_inputs
-from .operators.o_proj import golden_o_proj
-from .operators.prefill_indexer import golden_select_candidate_block_pool
-from .operators.qkv_proj_rope import golden_rope_tail
-from .operators.quant import dequantize_mxfp4_cache, quantize_mxfp4_cache, quantize_mxfp8_cache
-from .operators.rmsnorm import golden_rms_norm
-from .operators.weights import Checkpoint
+from .o_proj import golden_o_proj
+from .prefill_indexer import golden_select_candidate_block_pool
+from .qkv_proj_rope import golden_rope_tail
+from .quant import dequantize_mxfp4_cache, quantize_mxfp4_cache, quantize_mxfp8_cache
+from .rmsnorm import golden_rms_norm
+from .weights import Checkpoint
 
 
 def int8_product(source, weight):

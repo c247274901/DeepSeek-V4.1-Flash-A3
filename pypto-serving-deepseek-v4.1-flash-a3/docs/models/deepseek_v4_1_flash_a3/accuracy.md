@@ -10,33 +10,6 @@ Configuration checks and CPU tests do not establish complete-network accuracy.
 HCCL, weight loading and real Prefill/Decode accuracy require a separate
 16-device model run.
 
-## Numerical boundaries
-
-The generation network uses the same corrected operators for Prefill and Decode.
-Attention applies BF16 TP AllReduce to the local output-projection partials,
-then selects the existing SP token buckets.
-
-The shared expert retains four independent 576-channel quantization groups at
-TP4. Resident weight preparation pads each group to the GEMM alignment without
-changing its checkpoint bytes. Each group computes its own activation scale
-and BF16 Down output. The outputs use paired BF16 sums in TP rank order.
-
-Routed experts apply the token scale before the channel scale in FP32 for
-Gate-Up. Activation requantization computes `scale = max(abs(x)) / 127`, then
-rounds `x * reciprocal(scale)` through FP16 before INT8 rounding. Down projection
-uses FP32 channel scaling. Input quantization keeps its existing dynamic INT8
-boundary. These choices match the corresponding native shared and routed paths;
-their quantization boundaries differ from one another.
-
-MoE combine narrows selected routing probabilities to BF16 before multiplying
-the BF16 expert outputs, accumulates those products in FP32, and rounds the
-routed sum to BF16 before adding the reduced shared output.
-
-Operator replay and complete-network comparison are separate checks. Exact
-agreement for captured local inputs does not establish full-model agreement or
-dataset accuracy. Full-model reports must include the frozen inputs, native
-reference identity and measured logit errors.
-
 ## Prepare one immutable case file
 
 In the PyPTO environment, run from the repository root:
@@ -83,9 +56,11 @@ Prefill distribution and N-1 actual one-token Decode distributions. The final
 trace token is scored but never consumed as input. Top1 and TopK come from
 the raw distribution, independently of the forced trace token.
 
-The PyPTO collector calls the existing `prefill_fwd(..., keep_runtime=True)`
-and `DecodeNetwork.step` on the same generation session. It verifies that
-Decode retains the runtime and does not reload static weights.
+The PyPTO collector launches `models.deepseek_v4_1_flash_a3.generate` for
+each case. Prefill consumes the prepared prompt. Decode receives the fixed
+trace tokens while both phases share the request's weight and cache allocations.
+The collector verifies the actual Decode input IDs and the number of calls in
+each phase before saving the captured distributions.
 
 The vLLM collector sets `enable_trace_replay=True`,
 `SamplingParams(trace_decode_token_ids=..., temperature=0.0, logprobs=-1)` and
@@ -162,6 +137,11 @@ PyPTO:
 python -m tools.deepseek_v41_accuracy pypto \
     --cases "$RUN_DIR/cases.json" --output "$RUN_DIR/pypto" --chunk-size 16
 ```
+
+Pass `--graph-dir "$GRAPH_DIR"` to the PyPTO collector to use an existing
+pair of compiled graphs. The Prefill capacity must cover the requested chunk
+size and the history capacity must cover every prompt plus its trace. With no
+graph directory the collector builds the pair once for the prepared cases.
 
 Each capture writes a manifest and one FP32 `[trace_length, vocabulary_size]`
 tensor per case. The manifest records checkpoint identity, case-file hash,

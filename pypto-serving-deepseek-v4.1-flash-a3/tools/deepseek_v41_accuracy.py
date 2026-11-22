@@ -18,14 +18,15 @@ import math
 import os
 from pathlib import Path
 import re
+import subprocess
 import sys
 import traceback
 
 import torch
 
-from models.deepseek_v4_1_flash_a3.runtime_config import MAX_CONTEXT_TOKENS as MAX_CONTEXT, MAX_PREFILL_CHUNK_SIZE
-
 TOPOLOGY = dict(dp=4, tp=4, ep=16, pp=1, pcp=1, dcp=1)
+MAX_CONTEXT = 16384
+MAX_PREFILL_CHUNK_SIZE = 8192
 MAX_TRACE = 256
 CHECKPOINT_METADATA = (
     "config.json", "quant_model_weights.safetensors.index.json", "quant_model_description.json", "tokenizer.json",
@@ -177,47 +178,50 @@ def save_case(root, case, logits, vocabulary, **metadata):
                 argmax_token_ids=tensor.argmax(dim=-1).tolist(), **metadata)
 
 
-def capture_pypto(spec, cases_path, output, *, chunk_size=16):
-    from models.deepseek_v4_1_flash_a3.decode_network import DecodeNetwork
-    from models.deepseek_v4_1_flash_a3.staged_prefill import prefill_fwd
-    from models.deepseek_v4_1_flash_a3.prefill_prepare import checkpoint_cache
-    from models.deepseek_v4_1_flash_a3.runtime_config import prefill_execution_capacity
-    from models.deepseek_v4_1_flash_a3.runtime_config import configure_devices
-
-    devices = configure_devices(allocated_devices(), world=TOPOLOGY["ep"])
+def capture_pypto(spec, cases_path, output, *, chunk_size=16, graph_dir=None):
+    """Replay each fixed history through the same Prefill and Decode artifacts."""
+    devices = allocated_devices()
     output = Path(output)
     output.mkdir(parents=True, exist_ok=False)
     report = new_capture(spec, cases_path, "pypto")
     report.update(devices=devices, chunk_size=chunk_size)
     write_json(output / "manifest.json", report)
     try:
-        cache, config = checkpoint_cache(spec["checkpoint"], TOPOLOGY, capacity=prefill_execution_capacity(chunk_size))
         for case in spec["cases"]:
-            session, network = None, None
-            try:
-                contract = dict(config, chunk_size=chunk_size, dp_rank=0)
-                contract["context_capacity"] = len(case["prompt_token_ids"]) + len(case["trace_token_ids"])
-                directory = output / case["id"]
-                result = prefill_fwd(
-                    case["prompt_token_ids"], weights=spec["checkpoint"], cache=cache, config=contract,
-                    devices=devices, output=directory / "prefill", keep_runtime=True,
-                )
-                session = result.pop("session")
-                original_runtime, original_counters = session.runtime, session.weights.counters()
-                logits = [result["logits"][0]["fresh"][-1].clone()]
-                network = DecodeNetwork(session=session, output=directory / "decode")
-                for token in case["trace_token_ids"][:-1]:
-                    logits.append(network.step(token).clone())
-                session.weights.assert_static_unchanged()
-                if network.runtime is not original_runtime or session.weights.counters() != original_counters:
-                    raise RuntimeError("Decode replaced its original runtime or reloaded static weights")
-                record = save_case(output, case, torch.stack(logits), spec["vocab_size"],
-                                   runtime_reused=True, static_counters=original_counters, session=session.summary())
-            finally:
-                if network is not None:
-                    network.close()
-                if session is not None:
-                    session.close()
+            directory = output / "requests" / case["id"]
+            trace = case["trace_token_ids"]
+            request_path = directory / "input.json"
+            write_json(request_path, dict(request_id=case["id"], dp_rank=0,
+                                          input_ids=case["prompt_token_ids"], trace_token_ids=trace))
+            report_path = directory / "result.json"
+            logits_path = directory / "logits.pt"
+            cmd = [sys.executable, "-m", "models.deepseek_v4_1_flash_a3.generate",
+                   "--checkpoint", spec["checkpoint"], "--devices", ",".join(map(str, devices)),
+                   "--input-ids-json", str(request_path), "--chunk-size", str(chunk_size),
+                   "--max-new-tokens", str(len(trace)), "--ignore-eos",
+                   "--report", str(report_path), "--save-logits", str(logits_path)]
+            if graph_dir is None:
+                graph_dir = output / "graphs"
+                longest = max(len(c["prompt_token_ids"]) + len(c["trace_token_ids"]) for c in spec["cases"])
+                cmd.extend(("--output", str(graph_dir), "--context-capacity", str(max(128, chunk_size, longest))))
+            else:
+                cmd.extend(("--graph-dir", str(graph_dir)))
+            log_path = directory / "execution.log"
+            with log_path.open("w") as log:
+                completed = subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT)
+            if completed.returncode:
+                raise ValueError(f"{case['id']}: full graph exited with {completed.returncode}. See {log_path}")
+            execution = read_json(report_path)
+            if (not execution["teacher_forced"] or execution["decode_input_ids"] != trace[:-1]
+                    or execution["prefill_calls"] != math.ceil(len(case["prompt_token_ids"]) / chunk_size)
+                    or execution["decode_calls"] != len(trace) - 1):
+                raise ValueError(f"{case['id']}: full graph executed a different token history")
+            result = torch.load(logits_path, map_location="cpu", weights_only=True)
+            record = save_case(output, case, result["logits"], spec["vocab_size"],
+                               execution_report=str(report_path.relative_to(output)))
+            if result["token_ids"] != record["argmax_token_ids"]:
+                raise ValueError(f"{case['id']}: emitted tokens differ from the captured logits")
+            logits_path.unlink()
             report["cases"].append(record)
             write_json(output / "manifest.json", report)
         report["status"] = "complete"
@@ -415,6 +419,7 @@ def main(argv=None):
     pypto.add_argument("--cases", type=Path, required=True)
     pypto.add_argument("--output", type=Path, required=True)
     pypto.add_argument("--chunk-size", type=int, choices=range(1, MAX_PREFILL_CHUNK_SIZE + 1), default=16)
+    pypto.add_argument("--graph-dir", type=Path, help="Reuse compiled A3 prefill/ and decode/ graphs")
     pypto.add_argument("--check-config", action="store_true",
                        help="Validate cases without loading weights or using NPU")
     compare = commands.add_parser("compare", help="Compare raw full-vocabulary logits on CPU")
@@ -443,7 +448,7 @@ def main(argv=None):
             if args.check_config:
                 print(json.dumps(dict(status="config_checked", topology=TOPOLOGY, cases=spec["cases"], npu_run=False)))
             else:
-                result = capture_pypto(spec, args.cases, args.output, chunk_size=args.chunk_size)
+                result = capture_pypto(spec, args.cases, args.output, chunk_size=args.chunk_size, graph_dir=args.graph_dir)
                 print(json.dumps(dict(status=result["status"], accuracy="not_compared", output=str(args.output))))
         else:
             if args.output.exists():

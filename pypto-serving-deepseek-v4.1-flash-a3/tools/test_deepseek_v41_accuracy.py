@@ -41,6 +41,41 @@ def prepared(tmp_path):
     return spec, path, source
 
 
+@pytest.mark.parametrize("shift_history", [False, True])
+def test_full_graph_capture_checks_actual_decode_inputs(tmp_path, prepared, monkeypatch, shift_history):
+    spec, path, _ = prepared
+    output = tmp_path / "capture"
+    case = spec["cases"][0]
+    monkeypatch.setattr(accuracy, "allocated_devices", lambda: list(range(16)))
+    monkeypatch.setattr(accuracy.importlib.metadata, "version", lambda name: "test")
+
+    def run(cmd, **kwargs):
+        assert cmd[1:3] == ["-m", "models.deepseek_v4_1_flash_a3.generate"]
+        assert cmd[cmd.index("--graph-dir") + 1] == str(tmp_path / "graphs")
+        request = accuracy.read_json(cmd[cmd.index("--input-ids-json") + 1])
+        assert request["input_ids"] == case["prompt_token_ids"]
+        assert request["trace_token_ids"] == case["trace_token_ids"]
+        fed = request["trace_token_ids"][:-1]
+        if shift_history:
+            fed = [0] * len(fed)
+        accuracy.write_json(cmd[cmd.index("--report") + 1], dict(
+            teacher_forced=True, decode_input_ids=fed, prefill_calls=1, decode_calls=len(fed),
+        ))
+        logits = torch.zeros((len(case["trace_token_ids"]), spec["vocab_size"]))
+        torch.save(dict(logits=logits, token_ids=[0] * len(logits)), cmd[cmd.index("--save-logits") + 1])
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(accuracy.subprocess, "run", run)
+    if shift_history:
+        with pytest.raises(ValueError, match="different token history"):
+            accuracy.capture_pypto(spec, path, output, graph_dir=tmp_path / "graphs")
+        assert accuracy.read_json(output / "manifest.json")["status"] == "failed"
+    else:
+        report = accuracy.capture_pypto(spec, path, output, graph_dir=tmp_path / "graphs")
+        assert report["status"] == "complete"
+        assert report["cases"][0]["argmax_token_ids"] != case["trace_token_ids"]
+
+
 @pytest.fixture
 def captures(tmp_path, prepared):
     spec, path, _ = prepared

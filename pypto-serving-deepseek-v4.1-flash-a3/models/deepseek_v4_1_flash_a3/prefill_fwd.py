@@ -23,7 +23,7 @@ import argparse
 import pypto.language as pl
 import pypto.language.distributed as pld
 
-from .operators import config as C
+from . import config as C
 
 _shape_parser = argparse.ArgumentParser(add_help=False)
 _shape_parser.add_argument("--checkpoint")
@@ -42,7 +42,7 @@ if _shape_options.experts_per_rank != C.N_LOCAL_EXPERTS:
     _shape_parser.error("EP16 requires 24 experts per rank")
 C.set_moe_tokens(_shape_options.prefill_moe_slab_rows or C.default_prefill_slab_rows(CAPACITY))
 
-from .operators.config import (
+from .config import (
     FLASH as M,
     COMPRESSED_CACHE_GROUP,
     INDEX_CACHE_GROUP,
@@ -62,23 +62,23 @@ from .operators.config import (
     ROUTE_T_DYN,
 )
 
-from .operators.hc import hc_post
-from .operators.hc import hc_head, hc_pre, zero_bf16_padding
-from .operators.input_pack import gather_rows, pack_x_hc, prepare_compressed_lens
-from .operators.rope_tables import ROPE_ROWS_DYN, materialize_rope_rows
-from .operators.engram import ENGRAM_K, KV_OUT, engram_from_rows
-from .operators.lm_head import GROUP_LOGIT_ROWS, final_output
-from .operators.moe import ROUTED_RECV_ROWS, prefill_moe_sublayer, prefill_ffn_restore
-from .operators.moe import AUX_WIDTH, SIGNAL_PAD, clear_moe_signals
-from .operators.compressor import STATE_WIDTH
-from .operators.prefill_c1a_full import prefill_publish_decoder
-from .operators.prefill_swa import prefill_swa_attention
-from .operators.o_proj import retire_prefill_signals, prefill_tp_output_all_reduce
-from .operators.prefill_c2a_full import prefill_c2a_full_attention
-from .operators.prefill_c2a_reuse import prefill_c2a_reuse_attention
-from .operators.prefill_c1a_reindex import prefill_c1a_reindex_attention
-from .operators.prefill_c1a_reuse import prefill_c1a_reuse_attention
-from .operators.rmsnorm import rms_norm_tiled
+from .hc import hc_post
+from .hc import hc_head, hc_pre, zero_bf16_padding
+from .input_pack import gather_rows, pack_x_hc, prepare_compressed_lens
+from .rope_tables import ROPE_ROWS_DYN, materialize_rope_rows
+from .engram import ENGRAM_K, KV_OUT, engram_from_rows
+from .lm_head import GROUP_LOGIT_ROWS, final_output
+from .moe import ROUTED_RECV_ROWS, prefill_moe_sublayer, prefill_ffn_restore
+from .moe import AUX_WIDTH, SIGNAL_PAD, clear_moe_signals
+from .compressor import STATE_WIDTH
+from .prefill_c1a_full import prefill_publish_decoder
+from .prefill_swa import prefill_swa_attention
+from .o_proj import retire_prefill_signals, prefill_tp_output_all_reduce
+from .prefill_c2a_full import prefill_c2a_full_attention
+from .prefill_c2a_reuse import prefill_c2a_reuse_attention
+from .prefill_c1a_reindex import prefill_c1a_reindex_attention
+from .prefill_c1a_reuse import prefill_c1a_reuse_attention
+from .rmsnorm import rms_norm_tiled
 
 RANKS = C.EP_SIZE
 D = M.hidden_size

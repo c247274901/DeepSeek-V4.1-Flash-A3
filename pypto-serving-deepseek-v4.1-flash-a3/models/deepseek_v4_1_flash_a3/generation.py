@@ -27,12 +27,12 @@ from pypto.ir.distributed_compiled_program import DistributedCompiledProgram
 from pypto.runtime import DeviceTensor, ExecutionMode, RunConfig, StackedDeviceTensor
 from pypto.runtime.distributed_runner import DistributedWorker
 
-from .operators import config as C
-from .operators.config import FLASH as M
-from .operators.engram import HostEngram
+from . import config as C
+from .config import FLASH as M
+from .engram import HostEngram
 from .host import prepare_resident_inputs
-from .operators.utils import DECODE_CACHE_NAMES, decode_cache_views, prepare_decode_inputs
-from .operators.weights import Checkpoint, ResidentWeights
+from .utils import DECODE_CACHE_NAMES, decode_cache_views, prepare_decode_inputs
+from .weights import Checkpoint, ResidentWeights
 from .replay import DecodeInputs, LogitValidationError, reset_caches, run_request
 from .swimlane import profile_program_dirs, summarize_swimlanes
 
@@ -167,6 +167,14 @@ def read_request(args, tokenizer):
     ids = record["input_ids"]
     if not isinstance(ids, list) or not ids or any(type(v) is not int or not 0 <= v < M.vocab_size for v in ids):
         raise ValueError("Expected a nonempty array of valid integer token IDs")
+    if "trace_token_ids" in record:
+        trace = record["trace_token_ids"]
+        if not isinstance(trace, list) or len(trace) != args.max_new_tokens or any(
+            type(token) is not int or not 0 <= token < M.vocab_size for token in trace
+        ):
+            raise ValueError("trace_token_ids must contain one in-vocabulary token per requested output")
+        if args.reference_dir:
+            raise ValueError("A fixed-trace capture cannot also select a frozen reference replay")
     if len(ids) + args.max_new_tokens > args.context_capacity:
         raise ValueError("Prompt and reserved output positions exceed the compiled context")
     return record, dict(path=str(path) if path else None, sha256=hashlib.sha256(payload).hexdigest(),
