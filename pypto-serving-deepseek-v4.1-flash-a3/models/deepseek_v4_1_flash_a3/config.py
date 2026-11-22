@@ -6,20 +6,13 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""DeepSeek V4.1 Flash model dimensions and layer ownership."""
+"""DeepSeek-V4.1-Flash model, deployment, parallel, and shared shape configuration."""
 
+import sys
 from dataclasses import dataclass
-from enum import Enum
 from typing import Literal, Optional, Tuple
 
-
-class AttentionMode(str, Enum):
-    """Static attention implementation selected for one backbone layer."""
-
-    SWA = "swa"
-    FULL = "full"
-    REINDEX = "reindex"
-    REUSE = "reuse"
+import pypto.language as pl
 
 
 @dataclass(frozen=True)
@@ -31,7 +24,7 @@ class DeepSeekV41LayerConfig:
     kv_source_layer_id: Optional[int]
     index_source_layer_id: Optional[int]
     is_kv_source: bool
-    mode: AttentionMode
+    mode: str
 
 
 @dataclass(frozen=True)
@@ -87,11 +80,11 @@ class DeepSeekV41Config:
     engram_pad_token_id: int
     engram_compressed_vocab_size: int
     dtype: Literal["bfloat16"]
-    quant_method: Literal["fp8"]
+    quant_method: Literal["ascend"]
     activation_scheme: Literal["dynamic"]
     weight_block_size: Tuple[int, int]
-    expert_dtype: Optional[Literal["fp4"]]
-    scale_fmt: Optional[Literal["ue8m0"]]
+    expert_dtype: Optional[Literal["int8"]]
+    scale_fmt: Optional[Literal["float32"]]
 
     def __post_init__(self) -> None:
         self._validate_dimensions()
@@ -118,13 +111,13 @@ class DeepSeekV41Config:
         kv_source = self._active_source(layer_id, ratio, self.kv_source_layer_ids)
         index_source = self._active_source(layer_id, ratio, self.index_source_layer_ids)
         if ratio == 0:
-            mode = AttentionMode.SWA
+            mode = "swa"
         elif layer_id in self.kv_source_layer_ids:
-            mode = AttentionMode.FULL
+            mode = "full"
         elif layer_id in self.index_source_layer_ids:
-            mode = AttentionMode.REINDEX
+            mode = "reindex"
         else:
-            mode = AttentionMode.REUSE
+            mode = "reuse"
         return DeepSeekV41LayerConfig(
             layer_id=layer_id,
             compression_ratio=ratio,
@@ -186,7 +179,7 @@ class DeepSeekV41Config:
 
 
 FLASH = DeepSeekV41Config(
-    name="deepseek_v4_1_flash",
+    name="deepseek_v4_1_flash_a3",
     vocab_size=129280,
     hidden_size=5120,
     moe_intermediate_size=2304,
@@ -198,7 +191,7 @@ FLASH = DeepSeekV41Config(
     o_lora_rank=1024,
     o_groups=8,
     sliding_window=128,
-    rms_norm_eps=1e-20,
+    rms_norm_eps=1e-6,
     max_position_embeddings=1048576,
     rope_theta=10000.0,
     compress_rope_theta=160000.0,
@@ -235,9 +228,128 @@ FLASH = DeepSeekV41Config(
     engram_pad_token_id=2,
     engram_compressed_vocab_size=99092,
     dtype="bfloat16",
-    quant_method="fp8",
+    quant_method="ascend",
     activation_scheme="dynamic",
     weight_block_size=(32, 32),
-    expert_dtype="fp4",
-    scale_fmt="ue8m0",
+    expert_dtype="int8",
+    scale_fmt="float32",
 )
+
+
+BLOCK_SIZE = 128
+STATE_CAPACITY = 4
+MAX_BATCH_PER_DP = 12
+DSPARK_SPEC_TOKENS = 5
+DSPARK_DRAFT_LAYERS = 3
+DSPARK_QUERY_WIDTH = DSPARK_SPEC_TOKENS
+DSPARK_SWA_INDEX_WIDTH = (FLASH.sliding_window + DSPARK_QUERY_WIDTH + 63) // 64 * 64
+DSPARK_MARKOV_RANK = 256
+DSPARK_NOISE_TOKEN_ID = 128799
+DECODE_ROWS_PER_REQUEST = DSPARK_SPEC_TOKENS + 1
+DECODE_MAX_TOKENS = MAX_BATCH_PER_DP * DECODE_ROWS_PER_REQUEST
+PREFILL_MAX_TOKENS = 8192
+WINDOW_CACHE_GROUP = 32
+COMPRESSED_CACHE_GROUP = 16
+INDEX_CACHE_GROUP = 32
+
+
+# Shared symbolic dimensions
+T_DYN = pl.dynamic("V41_T_DYN")
+LOCAL_T_DYN = pl.dynamic("V41_LOCAL_T_DYN")
+SP_T_DYN = pl.dynamic("V41_SP_T_DYN")
+ROUTE_T_DYN = pl.dynamic("V41_ROUTE_T_DYN")
+B_DYN = pl.dynamic("V41_B_DYN")
+STATE_BLOCKS_DYN = pl.dynamic("V41_STATE_BLOCKS_DYN")
+Q_START_DYN = pl.dynamic("V41_Q_START_DYN")
+TABLE_DYN = pl.dynamic("V41_TABLE_DYN")
+ORI_BLOCKS_DYN = pl.dynamic("V41_ORI_BLOCKS_DYN")
+CMP_BLOCKS_DYN = pl.dynamic("V41_CMP_BLOCKS_DYN")
+INDEX_BLOCKS_DYN = pl.dynamic("V41_INDEX_BLOCKS_DYN")
+CMP_POSITIONS_DYN = pl.dynamic("V41_CMP_POSITIONS_DYN")
+INDEX_POOL_BLOCKS_DYN = pl.dynamic("V41_INDEX_POOL_BLOCKS_DYN")
+INDEX_POOL_POSITIONS_DYN = pl.dynamic("V41_INDEX_POOL_POSITIONS_DYN")
+
+
+# Parallel configuration
+SUPPORTED_TP_SIZES = (4,)
+SUPPORTED_EP_SIZES = (16,)
+
+
+def _parse_parallel_size(name: str, default: int) -> int:
+    flag = f"--{name}"
+    for index, argument in enumerate(sys.argv):
+        if argument == flag and index + 1 < len(sys.argv):
+            return int(sys.argv[index + 1])
+        if argument.startswith(f"{flag}="):
+            return int(argument.split("=", 1)[1])
+    return default
+
+
+def _platform() -> str:
+    for index, argument in enumerate(sys.argv):
+        if argument in ("-p", "--platform") and index + 1 < len(sys.argv):
+            return sys.argv[index + 1]
+        if argument.startswith("--platform="):
+            return argument.split("=", 1)[1]
+    return "a2a3"
+
+
+if _platform() != "a2a3":
+    raise ValueError("this implementation requires the a2a3 backend")
+IS_A3 = True
+FP8_DTYPE = pl.UINT8
+SCALE_DTYPE = pl.UINT8
+MX_A_LAYOUT = pl.ND
+MX_B_LAYOUT = pl.ND
+PROJECTION_LAYOUT = pl.ND
+EXPERT_N_TILE = 128
+EXPERT_K_TILE = 512
+WEIGHT_LAYOUT_VERSION = "v41-a3-w8a8-dynamic-expert-nk-v4"
+CACHE_LAYOUT_VERSION = "v41-a3-u8-paged128-v1"
+
+TP_SIZE = _parse_parallel_size("tp", 4)
+if TP_SIZE not in SUPPORTED_TP_SIZES:
+    raise ValueError(f"--tp must be one of {SUPPORTED_TP_SIZES}, got {TP_SIZE}")
+if FLASH.num_attention_heads % TP_SIZE or FLASH.o_groups % TP_SIZE:
+    raise ValueError(f"attention heads and output groups must be divisible by TP{TP_SIZE}")
+
+
+def get_ep_size() -> int:
+    """Resolve the EP size independently of the attention TP size."""
+    size = _parse_parallel_size("ep", 16)
+    if size not in SUPPORTED_EP_SIZES:
+        raise ValueError(f"--ep must be one of {SUPPORTED_EP_SIZES}, got {size}")
+    if FLASH.n_routed_experts % size:
+        raise ValueError(f"{FLASH.n_routed_experts} routed experts cannot be evenly sharded across EP{size}")
+    return size
+
+
+NATIVE_PREFILL_MOE_SLAB_ROWS = (64, 128, 256, 512, 1024, 2048)
+
+
+def default_prefill_slab_rows(capacity: int) -> int:
+    """Select the native EP slab for the full prompt or a smaller token allocation."""
+    return 2048 if capacity == PREFILL_MAX_TOKENS else 64
+
+
+def set_moe_tokens(tokens: int) -> None:
+    """Set the composed entry token extent before importing MoE kernels."""
+    if tokens <= 0 or tokens % 16:
+        raise ValueError(f"MoE tokens must be positive and divisible by 16, got {tokens}")
+    global MOE_TOKENS, MOE_RECV_MAX
+    MOE_TOKENS = tokens
+    MOE_RECV_MAX = EP_SIZE * tokens
+
+
+# Shared MoE deployment dimensions
+EP_SIZE = get_ep_size()
+DP_SIZE = _parse_parallel_size("dp", EP_SIZE // TP_SIZE)
+if DP_SIZE <= 0 or DP_SIZE * TP_SIZE != EP_SIZE:
+    raise ValueError("DP * TP must equal the EP world size")
+if IS_A3 and (DP_SIZE, TP_SIZE, EP_SIZE) != (4, 4, 16):
+    raise ValueError("the A3 text forward requires --dp 4 --tp 4 --ep 16")
+N_LOCAL_EXPERTS = FLASH.n_routed_experts // EP_SIZE
+MOE_TOKENS = 64
+MOE_RECV_MAX = EP_SIZE * MOE_TOKENS
+# Input gather publishes each rank's complete padded physical slab.
+DECODE_INPUT_MAX_TOKENS = (max(DECODE_MAX_TOKENS, MOE_TOKENS) + 15) // 16 * 16

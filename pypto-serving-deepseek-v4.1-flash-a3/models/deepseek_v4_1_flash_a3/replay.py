@@ -17,13 +17,13 @@ from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import torch
 
-from .prefill_resident import _device_view
-from .operators import config as C
+from . import config as C
 from .host import prepare_resident_inputs
 from .reference import compare_logits
 from .swimlane import step_name
 from .telemetry import route_distribution
-from .operators.utils import DECODE_CACHE_NAMES, paged_slots, window_metadata
+from .device_views import _device_view
+from .utils import DECODE_CACHE_NAMES, paged_slots, window_metadata
 
 
 class DecodeInputs:
@@ -109,14 +109,17 @@ def run_request(
     """Submit prompt chunks followed by one Decode call per subsequent token."""
     if teacher_forced and reference is None:
         raise ValueError("teacher forcing requires the frozen reference")
+    trace = reference["token_ids"] if teacher_forced else request.get("trace_token_ids")
     owner = request["dp_rank"] * 4
     constants = set(weights.tensor_layouts) | set(DECODE_CACHE_NAMES.values()) | {"freqs_cos", "freqs_sin"}
     counts = {name: arguments[1][name] for name in ("moe_num_tokens", "attention_num_tokens")}
     logit_buffer = host_io["logits"]
     sampled = host_io["sampled_ids"]
     report.update(prefill_calls=0, decode_calls=0, output_sequences=[], logit_checks=[], cache_checks=[],
-                  teacher_forced=teacher_forced, label=label, instrumented_cache_audits=audit is not None,
+                  teacher_forced=trace is not None, label=label, instrumented_cache_audits=audit is not None,
                   profiled=profile)
+    if trace is not None:
+        report["decode_input_ids"] = []
     committed = 0
     generated, token_times, engine_times, observed_logits = [], [], [], []
     tokenizer_config = json.loads((weights.checkpoint.root / "tokenizer_config.json").read_text())
@@ -136,7 +139,7 @@ def run_request(
             index = int(step > 0)
             capacity = options.decode_capacity if index else options.capacity
             if index:
-                current_ids = reference["token_ids"][step - 1:step] if teacher_forced else [generated[-1]]
+                current_ids = [trace[step - 1] if trace is not None else generated[-1]]
             else:
                 start_row = call * options.chunk_size
                 current_ids = prompt[start_row:start_row + options.chunk_size]
@@ -144,6 +147,8 @@ def run_request(
                 idle_uploads = [uploads.submit(decode_inputs.upload, runtime, rank, owner)
                                 for rank in range(16) if rank // C.TP_SIZE != request["dp_rank"]]
                 decode_inputs.stage_token(weights, engram, current_ids[0], committed, owner)
+                if trace is not None:
+                    report["decode_input_ids"].append(current_ids[0])
             else:
                 inputs = {}
                 for active, rank, ids, position in ((False, idle_rank, [], 0), (True, owner, current_ids, committed)):
@@ -232,7 +237,7 @@ def run_request(
             print("A3_TOKEN", json.dumps(dict(label=label, step=step + 1, token_id=token, committed=committed)), flush=True)
             if audit is not None:
                 report["cache_checks"].append(audit(runtime, ranks, host_cache, owner, step))
-            if token == eos_id and not options.ignore_eos:
+            if token == eos_id and not options.ignore_eos and request.get("trace_token_ids") is None:
                 if (reference is not None or profile_dir is not None) and step + 1 < options.max_new_tokens:
                     raise RuntimeError("Reference replay reached EOS before its last step")
                 break

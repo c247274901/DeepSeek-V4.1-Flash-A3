@@ -12,8 +12,8 @@ import sys
 from pathlib import Path
 
 if not __package__:
-    sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
-    __package__ = "models.deepseek_v4_1_flash_a3.operators"
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    __package__ = "models.deepseek_v4_1_flash_a3"
 
 
 from .gemm import gemm_bf16_to_bf16, gemm_dynamic_int8, gemm_int8

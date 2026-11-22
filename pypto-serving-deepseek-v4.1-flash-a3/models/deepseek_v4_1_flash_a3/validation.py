@@ -16,14 +16,14 @@ import torch
 import torch.nn.functional as F
 from golden import ratio_allclose
 
-from .operators.config import FLASH as M
+from .config import FLASH as M
 from .host import prepare_prefill_inputs, prepare_resident_inputs
-from .operators.hc import golden_hc_collapse, golden_mhc_mixes
-from .operators.engram import golden_engram
-from .operators.gate import golden_gate_reference
+from .hc import golden_hc_collapse, golden_mhc_mixes
+from .engram import golden_engram
+from .gate import golden_gate_reference
 from .reference import W8A8Reference
-from .operators.rmsnorm import golden_rms_norm
-from .operators.quant import dequantize_mxfp4_cache, dequantize_mxfp8_cache
+from .rmsnorm import golden_rms_norm
+from .quant import dequantize_mxfp4_cache, dequantize_mxfp8_cache
 
 
 class LayerValidationError(ValueError):

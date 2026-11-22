@@ -12,8 +12,8 @@ import sys
 from pathlib import Path
 
 if not __package__:
-    sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
-    __package__ = "models.deepseek_v4_1_flash_a3.operators"
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    __package__ = "models.deepseek_v4_1_flash_a3"
 
 import pypto.language as pl
 from .gemm import quantize_activation

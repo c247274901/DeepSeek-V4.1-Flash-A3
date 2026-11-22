@@ -6,942 +6,485 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Blocked GEMM, BF16 projections and Eco-Tech W8A8 linear compositions."""
+"""A3 dynamic INT8 Cube projections and ordered BF16 products."""
 
-import math
-import pypto.language as pl
-from .runtime_config import SPMD_WORKER_LIMIT
+import sys
+from pathlib import Path
+
+if not __package__:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    __package__ = "models.deepseek_v4_1_flash_a3"
+
 import torch
-from .quant import make_dequantize, make_prefill_projection_quantize, make_quantize
-from .utils import pack_blocked_weight
-
-M_TILE = 16
-PREFILL_QB_M_TILE = 64
-N_TILE = 64
-K_TILE = 256
-VEC_M_TILE = 8
-FULL_K_TILE = 5120
-
-NAMESPACE = "pypto_dsv41_bf16_linear_v1"
-SCHEMA = "linear(Tensor source, Tensor weight_nk) -> Tensor"
+import pypto.language as pl
+from .activation_quant import quantize_activation
+from .quant import decode_fp8, decode_scale
 
 
-def make_pack_weight(width: int, output_width: int):
-    """Pack canonical ``[K, N]`` INT8 weights into 64-column blocks."""
+MM_M_DYN = pl.dynamic("A3_MM_M_DYN")
+MM_K_DYN = pl.dynamic("A3_MM_K_DYN")
+MM_N_DYN = pl.dynamic("A3_MM_N_DYN")
+MM_S_DYN = pl.dynamic("A3_MM_S_DYN")
 
-    if output_width % N_TILE or width % K_TILE:
-        raise ValueError("A2/A3 weight packing requires K divisible by 256 and N by 64")
-    packed_rows = width * (output_width // N_TILE)
-
-    @pl.jit.inline
-    def pack(
-        weight: pl.Tensor[[width, output_width], pl.INT8],
-        packed: pl.Tensor[[packed_rows, N_TILE], pl.INT8],
-    ):
-        for block in pl.spmd(output_width // N_TILE, name_hint="dsv41_a2a3_pack_weight"):
-            n0 = block * N_TILE
-            for k0 in pl.range(0, width, K_TILE):
-                packed[block * width + k0 : block * width + k0 + K_TILE, :] = weight[
-                    k0 : k0 + K_TILE, n0 : n0 + N_TILE
-                ]
-        return packed
-
-    return pack
+DOT_K_TILE = 16
 
 
-def make_int8_gemm(capacity: int, width: int, output_width: int):
-    """Accumulate INT8 activations and packed INT8 weights into INT32."""
-
-    if capacity % M_TILE or width % K_TILE:
-        raise ValueError("capacity must be divisible by 16 and K by 256")
-    packed_rows = width * (output_width // N_TILE)
-
-    @pl.jit.inline
-    def gemm(
-        payload: pl.Tensor[[capacity, width], pl.INT8],
-        packed: pl.Tensor[[packed_rows, N_TILE], pl.INT8],
-        accumulator: pl.Tensor[[capacity, output_width], pl.INT32],
-        active: pl.Scalar[pl.INT32],
-    ):
-        blocks = output_width // N_TILE
-        for block in pl.spmd(((active + 15) // M_TILE) * blocks, name_hint="dsv41_a2a3_int8_gemm"):
-            t0 = (block // blocks) * 16
-            n0 = (block % blocks) * N_TILE
-            rows = pl.min(M_TILE, active - t0)
-            acc = pl.create_tensor([M_TILE, N_TILE], dtype=pl.INT32)
-            for k0 in pl.pipeline(0, width, K_TILE, stage=2):
-                lhs = pl.slice(payload, [M_TILE, K_TILE], [t0, k0], valid_shape=[rows, K_TILE])
-                lhs = pl.set_validshape(pl.fillpad(lhs, pad_value=pl.PadValue.zero), M_TILE, K_TILE)
-                rhs = packed[(block % blocks) * width + k0 : (block % blocks) * width + k0 + K_TILE, :]
-                acc = pl.matmul_acc(acc, lhs, rhs, init_cond=(k0 == 0))
-            accumulator[t0 : t0 + M_TILE, n0 : n0 + N_TILE] = pl.set_validshape(acc, rows, N_TILE)
-        return accumulator
-
-    return gemm
+@pl.jit.inline(auto_scope=False)
+def bf16_ordered_accumulate(
+    total: pl.Tile[[MM_M_DYN, MM_N_DYN], pl.FP32],
+    left: pl.Tile[[MM_M_DYN, MM_K_DYN], pl.BF16],
+    right: pl.Tile[[MM_K_DYN, MM_N_DYN], pl.BF16],
+    rows: pl.constexpr,
+    columns: pl.constexpr,
+    width: pl.constexpr,
+):
+    """Add BF16 outer products to FP32 in increasing reduction order."""
+    total = pl.reshape(total, [rows, columns])
+    left = pl.reshape(left, [rows, width])
+    right = pl.reshape(right, [width, columns])
+    left_columns = pl.tile.transpose(left, 0, 1)
+    ones = pl.tile.full([rows, columns], dtype=pl.FP32, value=1.0)
+    for inner in pl.range(width):
+        left_row = pl.tile.slice(left_columns, [1, rows], [inner, 0])
+        right_row = pl.tile.slice(right, [1, columns], [inner, 0])
+        left_column = pl.reshape(pl.cast(left_row, pl.FP32), [rows, 1])
+        right_row = pl.cast(right_row, pl.FP32)
+        expanded = pl.row_expand_mul(ones, left_column)
+        product = pl.col_expand_mul(expanded, right_row)
+        total = pl.add(total, product)
+    return total
 
 
-def make_fp32_dequantize(capacity: int, output_width: int):
-    """Apply token/channel FP32 scales and narrow the result to BF16."""
-
-    if output_width % N_TILE:
-        raise ValueError("output width must be divisible by 64")
-
-    @pl.jit.inline
-    def dequantize(
-        accumulator: pl.Tensor[[capacity, output_width], pl.INT32],
-        token_scale: pl.Tensor[[capacity, 1], pl.FP32],
-        channel_scale: pl.Tensor[[output_width], pl.FP32],
-        output: pl.Tensor[[capacity, output_width], pl.BF16],
-        active: pl.Scalar[pl.INT32],
-    ):
-        blocks = output_width // N_TILE
-        for block in pl.spmd(((active + 7) // 8) * blocks, name_hint="dsv41_a2a3_dequant"):
-            t0 = (block // blocks) * 8
-            n0 = (block % blocks) * N_TILE
-            rows = pl.min(8, active - t0)
-            value = pl.cast(accumulator[t0 : t0 + 8, n0 : n0 + N_TILE], pl.FP32)
-            channels = pl.reshape(channel_scale[n0 : n0 + N_TILE], [1, N_TILE])
-            value = pl.col_expand_mul(value, channels)
-            # Preserve the 2-D [rows, 1] view so the backend emits the legal
-            # row-scale load used by the A2/A3 W8A8 kernels.
-            scale = token_scale[t0 : t0 + 8, 0:1]
-            value = pl.row_expand_mul(value, scale)
-            output[t0 : t0 + 8, n0 : n0 + N_TILE] = pl.set_validshape(
-                pl.cast(value, pl.BF16, mode="rint"), rows, N_TILE
-            )
-        return output
-
-    return dequantize
+@pl.jit.inline(auto_scope=False)
+def bf16_dot_sequential(
+    query: pl.Tensor,
+    keys: pl.Tensor,
+    query_offset: pl.Scalar[pl.INDEX],
+    key_offset: pl.Scalar[pl.INDEX],
+    heads: pl.constexpr,
+    key_rows: pl.constexpr,
+    width: pl.constexpr,
+):
+    """Accumulate BF16 outer products in increasing K order in FP32."""
+    total = pl.tile.full([heads, key_rows], dtype=pl.FP32, value=0.0)
+    for first in pl.range(0, width, DOT_K_TILE):
+        left = pl.load(query, [query_offset, first], [heads, DOT_K_TILE])
+        right = pl.load(keys, [key_offset, first], [key_rows, DOT_K_TILE])
+        right_columns = pl.tile.transpose(right, 0, 1)
+        total = bf16_ordered_accumulate(total, left, right_columns, heads, key_rows, DOT_K_TILE)
+    return total
 
 
-def make_int8_linear_direct(capacity: int, width: int, output_width: int):
-    """Build a W8A8 linear that consumes canonical ``[K, N]`` weights.
-
-    The packed-weight helper is useful for the leaf ABI, but materializing a
-    full packed matrix is too large for the A2/A3 Mat buffer at V4.1 widths.
-    This variant loads one ``[K_TILE, N_TILE]`` canonical tile per GEMM
-    reduction and keeps only the accumulator tile on core.
-    """
-
-    if capacity % M_TILE or width % K_TILE or output_width % N_TILE:
-        raise ValueError("direct INT8 GEMM requires aligned capacity, K and N")
-
-    from .quant import make_dynamic_int8_quantize
-
-    quantize = make_dynamic_int8_quantize(capacity, width)
-    blocks = output_width // N_TILE
-
-    @pl.jit
-    def linear(
-        value: pl.Tensor[[capacity, width], pl.BF16],
-        weight: pl.Tensor[[width, output_width], pl.INT8],
-        channel_scale: pl.Tensor[[output_width], pl.FP32],
-        output: pl.InOut[pl.Tensor[[capacity, output_width], pl.BF16]],
-        active: pl.Scalar[pl.INT32],
-    ):
-        payload = pl.create_tensor([capacity, width], dtype=pl.INT8)
-        token_scale = pl.create_tensor([capacity, 1], dtype=pl.FP32)
-        quantize(value, payload, token_scale, active)
-        for block in pl.spmd(
-            ((active + M_TILE - 1) // M_TILE) * blocks, name_hint="dsv41_a2a3_direct_int8_linear"
-        ):
-            t0 = (block // blocks) * M_TILE
-            n0 = (block % blocks) * N_TILE
-            rows = pl.min(M_TILE, active - t0)
-            acc = pl.create_tensor([M_TILE, N_TILE], dtype=pl.INT32)
-            for k0 in pl.pipeline(0, width, K_TILE, stage=2):
-                lhs = pl.slice(payload, [M_TILE, K_TILE], [t0, k0], valid_shape=[rows, K_TILE])
-                lhs = pl.set_validshape(pl.fillpad(lhs, pad_value=pl.PadValue.zero), M_TILE, K_TILE)
-                rhs = weight[k0 : k0 + K_TILE, n0 : n0 + N_TILE]
-                acc = pl.matmul_acc(acc, lhs, rhs, init_cond=(k0 == 0))
-            value_fp32 = pl.cast(acc, pl.FP32)
-            channels = pl.reshape(channel_scale[n0 : n0 + N_TILE], [1, N_TILE])
-            value_fp32 = pl.col_expand_mul(value_fp32, channels)
-            value_fp32 = pl.row_expand_mul(value_fp32, token_scale[t0 : t0 + M_TILE, :])
-            output[t0 : t0 + M_TILE, n0 : n0 + N_TILE] = pl.set_validshape(
-                pl.cast(value_fp32, pl.BF16, mode="rint"), rows, N_TILE
-            )
-        return output
-
-    return linear
+@pl.jit.inline(auto_scope=False)
+def mx_mm_acc(
+    acc: pl.Tile[[MM_M_DYN, MM_N_DYN], pl.FP32],
+    a: pl.Tile[[MM_M_DYN, MM_K_DYN], pl.UINT8],
+    sa: pl.Tile[[MM_M_DYN, MM_S_DYN], pl.UINT8],
+    b: pl.Tile[[MM_K_DYN, MM_N_DYN], pl.UINT8],
+    sb: pl.Tile[[MM_S_DYN, MM_N_DYN], pl.UINT8],
+    m: pl.constexpr,
+    k: pl.constexpr,
+    n: pl.constexpr,
+):
+    """Accumulate group-32 products through BF16 Cube and FP32 scale application."""
+    acc = pl.reshape(acc, [m, n])
+    group_count = k // 32
+    left_codes = pl.reshape(sa, [1, m * group_count])
+    right_codes = pl.reshape(sb, [1, n * group_count])
+    left_factors = decode_scale(left_codes, 1, m * (k // 32))
+    right_factors = decode_scale(right_codes, 1, n * (k // 32))
+    left_lanes = pl.tile.arange(0, [1, m], dtype=pl.INT32)
+    right_lanes = pl.tile.arange(0, [1, n], dtype=pl.INT32)
+    left_tmp = pl.create_tile([1, m], dtype=pl.INT32)
+    right_tmp = pl.create_tile([1, n], dtype=pl.INT32)
+    decoded_a = decode_fp8(a, m, k)
+    decoded_b = decode_fp8(b, k, n)
+    for group in pl.range(group_count):
+        a_group = pl.tile.slice(decoded_a, [m, 32], [0, group * 32])
+        b_group = pl.tile.slice(decoded_b, [32, n], [group * 32, 0])
+        left = pl.cast(pl.cast(a_group, pl.FP32), pl.BF16, mode="rint")
+        right = pl.cast(pl.cast(b_group, pl.FP32), pl.BF16, mode="rint")
+        product = pl.matmul(left, right)
+        left_indices = pl.add(pl.mul(left_lanes, pl.cast(group_count, pl.INT32)), pl.cast(group, pl.INT32))
+        right_indices = pl.add(pl.mul(right_lanes, pl.cast(group_count, pl.INT32)), pl.cast(group, pl.INT32))
+        left_scale = pl.tile.gather(left_factors, left_indices, left_tmp)
+        left_scale = pl.reshape(left_scale, [m, 1])
+        right_scale = pl.tile.gather(right_factors, right_indices, right_tmp)
+        scaled_left = pl.row_expand_mul(product, left_scale)
+        scaled = pl.col_expand_mul(scaled_left, right_scale)
+        acc = pl.add(acc, scaled)
+    return acc
 
 
-def make_bf16_linear(capacity: int, width: int, output_width: int):
-    """BF16-input/FP32-accumulate linear for compressor and Engram paths."""
-
-    if capacity % 16 or width % 256 or output_width % 32:
-        raise ValueError("BF16 linear dimensions are not A2/A3 aligned")
-    n_tile = 64 if output_width % 64 == 0 else 32
-    blocks = output_width // n_tile
-
-    @pl.jit
-    def linear(
-        value: pl.Tensor[[capacity, width], pl.BF16],
-        weight: pl.Tensor[[width, output_width], pl.BF16],
-        output: pl.InOut[pl.Tensor[[capacity, output_width], pl.BF16]],
-        active: pl.Scalar[pl.INT32],
-    ):
-        block_count = (active + 15) // 16 * blocks
-        for block_worker in pl.spmd(pl.min(block_count, SPMD_WORKER_LIMIT), name_hint='dsv41_a2a3_bf16_linear'):
-            for block in pl.range(block_worker, block_count, SPMD_WORKER_LIMIT):
-                t0 = (block // blocks) * 16
-                n0 = (block % blocks) * n_tile
-                rows = pl.min(16, active - t0)
-                acc = pl.create_tensor([16, n_tile], dtype=pl.FP32)
-                for k0 in pl.pipeline(0, width, 256, stage=2):
-                    lhs = pl.slice(value, [16, 256], [t0, k0], valid_shape=[rows, 256])
-                    lhs = pl.set_validshape(pl.fillpad(lhs, pad_value=pl.PadValue.zero), 16, 256)
-                    rhs = weight[k0 : k0 + 256, n0 : n0 + n_tile]
-                    acc = pl.matmul_acc(acc, lhs, rhs, init_cond=(k0 == 0))
-                output[t0 : t0 + 16, n0 : n0 + n_tile] = pl.set_validshape(
-                    pl.cast(acc, pl.BF16, mode="rint"), rows, n_tile
-                )
-        return output
-
-    return linear
+@pl.jit.inline(auto_scope=False)
+def mx_mm(
+    a: pl.Tile[[MM_M_DYN, MM_K_DYN], pl.UINT8],
+    sa: pl.Tile[[MM_M_DYN, MM_S_DYN], pl.UINT8],
+    b: pl.Tile[[MM_K_DYN, MM_N_DYN], pl.UINT8],
+    sb: pl.Tile[[MM_S_DYN, MM_N_DYN], pl.UINT8],
+    m: pl.constexpr,
+    k: pl.constexpr,
+    n: pl.constexpr,
+):
+    """Compute group-32 products with a zero FP32 accumulator."""
+    acc = pl.tile.full([m, n], dtype=pl.FP32, value=0.0)
+    return mx_mm_acc(acc, a, sa, b, sb, m, k, n)
 
 
-def make_fp32_linear(capacity: int, width: int, output_width: int):
-    """BF16-input/FP32-weight linear used by the ratio-2 compressor."""
-
-    if capacity % 16 or width % 256 or output_width % 32:
-        raise ValueError("FP32 linear dimensions are not A2/A3 aligned")
-    n_tile = 64 if output_width % 64 == 0 else 32
-    blocks = output_width // n_tile
-
-    @pl.jit
-    def linear(
-        value: pl.Tensor[[capacity, width], pl.BF16],
-        weight: pl.Tensor[[width, output_width], pl.FP32],
-        output: pl.InOut[pl.Tensor[[capacity, output_width], pl.BF16]],
-        active: pl.Scalar[pl.INT32],
-    ):
-        for block in pl.spmd(((active + 15) // 16) * blocks, name_hint="dsv41_a2a3_fp32_linear"):
-            t0 = (block // blocks) * 16
-            n0 = (block % blocks) * n_tile
-            rows = pl.min(16, active - t0)
-            acc = pl.create_tensor([16, n_tile], dtype=pl.FP32)
-            for k0 in pl.pipeline(0, width, 256, stage=2):
-                lhs = pl.slice(value, [16, 256], [t0, k0], valid_shape=[rows, 256])
-                lhs = pl.set_validshape(pl.fillpad(lhs, pad_value=pl.PadValue.zero), 16, 256)
-                rhs = weight[k0 : k0 + 256, n0 : n0 + n_tile]
-                acc = pl.matmul_acc(acc, lhs, rhs, init_cond=(k0 == 0))
-            output[t0 : t0 + 16, n0 : n0 + n_tile] = pl.set_validshape(
-                pl.cast(acc, pl.BF16, mode="rint"), rows, n_tile
-            )
-        return output
-
-    return linear
-
-
-def make_blocked_weight_pack(width, output_width):
-    """Reorder canonical [K,N] INT8 bytes to [N/64,K,64]."""
-    packed_rows = width * (output_width // N_TILE)
-
-    @pl.jit.inline
-    def pack_weight(
-        weight: pl.Tensor[[width, output_width], pl.INT8],
-        packed: pl.Tensor[[packed_rows, N_TILE], pl.INT8],
-    ):
-        for nb in pl.spmd(output_width // N_TILE, name_hint="a2_pack_weight"):
-            n0 = nb * N_TILE
-            for k0 in pl.range(0, width, K_TILE):
-                block = weight[k0 : k0 + K_TILE, n0 : n0 + N_TILE]
-                packed_k0 = nb * width + k0
-                packed[packed_k0 : packed_k0 + K_TILE, :] = block
-        return packed
-
-    return pack_weight
-
-
-def make_dot(capacity, width, output_width, *, full_k_reuse=False, column_group=1, column_stages=1,
-             row_tile=M_TILE, paired_columns=False):
-    """Accumulate complete blocked INT8 products in INT32."""
-    packed_rows = width * (output_width // N_TILE)
-
-    if paired_columns:
-        if output_width % (2 * N_TILE) or capacity % row_tile or width % K_TILE:
-            raise ValueError("Paired-column GEMM requires aligned M, N and K tiles")
-
-        @pl.jit.inline
-        def dot_paired_columns(
-            payload: pl.Tensor[[capacity, width], pl.INT8],
-            packed: pl.Tensor[[packed_rows, N_TILE], pl.INT8],
-            accumulator: pl.Tensor[[capacity, output_width], pl.INT32],
-            active: pl.Scalar[pl.INT32],
-        ):
-            tiles = (active + row_tile - 1) // row_tile
-            for block in pl.spmd(tiles * (output_width // (2 * N_TILE)), name_hint="prefill_dot_paired_columns"):
-                nb = block % (output_width // (2 * N_TILE)) * 2
-                t0 = block // (output_width // (2 * N_TILE)) * row_tile
-                rows = pl.min(row_tile, active - t0)
-                first = pl.create_tensor([row_tile, N_TILE], dtype=pl.INT32)
-                second = pl.create_tensor([row_tile, N_TILE], dtype=pl.INT32)
-                for k0 in pl.pipeline(0, width, K_TILE, stage=2):
-                    source = payload[t0 : t0 + row_tile, k0 : k0 + K_TILE]
-                    offset = nb * width + k0
-                    w0 = packed[offset : offset + K_TILE, :]
-                    w1 = packed[offset + width : offset + width + K_TILE, :]
-                    first = pl.matmul_acc(first, source, w0, init_cond=(k0 == 0))
-                    second = pl.matmul_acc(second, source, w1, init_cond=(k0 == 0))
-                n0 = nb * N_TILE
-                n1 = n0 + N_TILE
-                accumulator[t0 : t0 + row_tile, n0 : n1] = pl.set_validshape(first, rows, N_TILE)
-                accumulator[t0 : t0 + row_tile, n1 : n1 + N_TILE] = pl.set_validshape(second, rows, N_TILE)
-            return accumulator
-
-        return dot_paired_columns
-
-    if full_k_reuse and width <= FULL_K_TILE:
-        row_tile = math.gcd(capacity, row_tile)
-
-        @pl.jit.inline
-        def dot_full_k(
-            payload: pl.Tensor[[capacity, width], pl.INT8],
-            packed: pl.Tensor[[packed_rows, N_TILE], pl.INT8],
-            accumulator: pl.Tensor[[capacity, output_width], pl.INT32],
-            active: pl.Scalar[pl.INT32],
-        ):
-            row_blocks = (active + row_tile - 1) // row_tile
-            column_blocks = (output_width // N_TILE + column_group - 1) // column_group
-            for block in pl.spmd(row_blocks * column_blocks, name_hint="prefill_int8_dot_full_k"):
-                t0 = block // column_blocks * row_tile
-                first_nb = block % column_blocks * column_group
-                last_nb = pl.min(first_nb + column_group, output_width // N_TILE)
-                rows = pl.min(row_tile, active - t0)
-                source = pl.load(payload, [t0, 0], [row_tile, width], valid_shape=[rows, width], target_memory=pl.Mem.Mat)
-                for nb in pl.pipeline(first_nb, last_nb, stage=column_stages):
-                    n0 = nb * N_TILE
-                    packed_k0 = nb * width
-                    weight = pl.load(packed, [packed_k0, 0], [width, N_TILE], target_memory=pl.Mem.Mat)
-                    product = pl.matmul(source, weight, out_dtype=pl.INT32)
-                    pl.store(product, [t0, n0], accumulator)
-            return accumulator
-
-        return dot_full_k
-
-    @pl.jit.inline
-    def dot(
-        payload: pl.Tensor[[capacity, width], pl.INT8],
-        packed: pl.Tensor[[packed_rows, N_TILE], pl.INT8],
-        accumulator: pl.Tensor[[capacity, output_width], pl.INT32],
-        active: pl.Scalar[pl.INT32],
-    ):
-        row_blocks = (active + M_TILE - 1) // M_TILE
-        for block in pl.spmd(row_blocks * (output_width // N_TILE), name_hint="a2_int8_dot"):
-            t0 = (block // (output_width // N_TILE)) * M_TILE
-            nb = block % (output_width // N_TILE)
-            n0 = nb * N_TILE
-            rows = pl.min(M_TILE, active - t0)
-            acc = pl.create_tensor([M_TILE, N_TILE], dtype=pl.INT32)
-            for k0 in pl.pipeline(0, width, K_TILE, stage=2):
-                a = pl.slice(payload, [M_TILE, K_TILE], [t0, k0], valid_shape=[rows, K_TILE])
-                a = pl.set_validshape(pl.fillpad(a, pad_value=pl.PadValue.zero), M_TILE, K_TILE)
-                packed_k0 = nb * width + k0
-                b = packed[packed_k0 : packed_k0 + K_TILE, :]
-                acc = pl.matmul_acc(acc, a, b, init_cond=(k0 == 0))
-            accumulator[t0 : t0 + M_TILE, n0 : n0 + N_TILE] = acc
-        return accumulator
-
-    return dot
-
-
-def make_decode_int8_linear_direct(capacity: int, width: int, output_width: int):
-    """Build a W8A8 linear that consumes canonical ``[K, N]`` weights.
-
-    The packed-weight helper is useful for the leaf ABI, but materializing a
-    full packed matrix is too large for the A2/A3 Mat buffer at V4.1 widths.
-    This variant loads one ``[K_TILE, N_TILE]`` canonical tile per GEMM
-    reduction and keeps only the accumulator tile on core.
-    """
-
-    if capacity % M_TILE or width % K_TILE or output_width % N_TILE:
-        raise ValueError("direct INT8 GEMM requires aligned capacity, K and N")
-
-    from .quant import make_decode_dynamic_int8_quantize as make_dynamic_int8_quantize
-
-    quantize = make_dynamic_int8_quantize(capacity, width)
-    blocks = output_width // N_TILE
-
-    @pl.jit
-    def linear(
-        value: pl.Tensor[[capacity, width], pl.BF16],
-        weight: pl.Tensor[[width, output_width], pl.INT8],
-        channel_scale: pl.Tensor[[output_width], pl.FP32],
-        output: pl.InOut[pl.Tensor[[capacity, output_width], pl.BF16]],
-        active: pl.Scalar[pl.INT32],
-    ):
-        payload = pl.create_tensor([capacity, width], dtype=pl.INT8)
-        token_scale = pl.create_tensor([capacity, 1], dtype=pl.FP32)
-        quantize(value, payload, token_scale, active)
-        for block in pl.spmd(
-            ((active + M_TILE - 1) // M_TILE) * blocks, name_hint="dsv41_a2a3_direct_int8_linear"
-        ):
-            t0 = (block // blocks) * M_TILE
-            n0 = (block % blocks) * N_TILE
-            rows = pl.min(M_TILE, active - t0)
-            acc = pl.create_tensor([M_TILE, N_TILE], dtype=pl.INT32)
-            for k0 in pl.pipeline(0, width, K_TILE, stage=2):
-                lhs = pl.slice(payload, [M_TILE, K_TILE], [t0, k0], valid_shape=[rows, K_TILE])
-                lhs = pl.set_validshape(pl.fillpad(lhs, pad_value=pl.PadValue.zero), M_TILE, K_TILE)
-                rhs = weight[k0 : k0 + K_TILE, n0 : n0 + N_TILE]
-                acc = pl.matmul_acc(acc, lhs, rhs, init_cond=(k0 == 0))
-            value_fp32 = pl.cast(acc, pl.FP32)
-            channels = pl.reshape(channel_scale[n0 : n0 + N_TILE], [1, N_TILE])
-            value_fp32 = pl.col_expand_mul(value_fp32, channels)
-            value_fp32 = pl.row_expand_mul(value_fp32, token_scale[t0 : t0 + M_TILE, :])
-            output[t0 : t0 + M_TILE, n0 : n0 + N_TILE] = pl.set_validshape(
-                pl.cast(value_fp32, pl.BF16, mode="rint"), rows, N_TILE
-            )
-        return output
-
-    return linear
-
-
-def prepare_ecotech_dynamic_weight(weight_nk, source_scale, source_offset):
-    """Pack CPU checkpoint weights once and retain effective FP32 channel scales."""
-    values = (weight_nk, source_scale, source_offset)
-    if any(value.device.type != "cpu" for value in values):
-        raise ValueError("Checkpoint preprocessing requires CPU source tensors")
-    if weight_nk.ndim != 2 or weight_nk.dtype != torch.int8:
-        raise ValueError("The source weight must be a complete NK INT8 tensor")
-    output_width, input_width = weight_nk.shape
-    if input_width % 256 or output_width % 64:
-        raise ValueError("The A3 blocked projection requires K/256 and N/64 alignment")
-    for value in (source_scale, source_offset):
-        if value.shape != (output_width, 1) or value.dtype != torch.float32:
-            raise ValueError("Source per-channel scale and offset require FP32 [N,1]")
-        if any(not math.isfinite(item) for item in value.flatten().tolist()):
-            raise ValueError("Source scale and offset must be finite")
-    if any(item != 0 for item in source_offset.flatten().tolist()):
-        raise ValueError("The symmetric native INT8 path requires zero checkpoint offsets")
-    native_scale = source_scale.to(torch.bfloat16)
-    if any(not math.isfinite(item) or item <= 0 for item in native_scale.flatten().tolist()):
-        raise ValueError("Effective BF16 channel scales must remain finite and positive")
-    weight_kn = weight_nk.T.contiguous()
-    channel_scale = native_scale.to(torch.float32).flatten()
-    return pack_blocked_weight(weight_kn), channel_scale
-
-
-def _make_full_k_dynamic_linear(capacity, input_width, output_width, combine_scales, quantize):
-    """Project full-K INT8 tiles and apply channel/token scales before BF16 stores."""
-    qb_columns = input_width == 1280 and output_width == 32768
-    qb_large_rows = qb_columns and capacity >= PREFILL_QB_M_TILE
-    column_group = 26 if qb_columns else 1
-    column_stages = 2 if qb_columns else 1
-    column_blocks = (output_width // N_TILE + column_group - 1) // column_group
-    packed_rows = input_width * (output_width // N_TILE)
-
-    def make_project(row_tile, partial):
-        @pl.jit.inline
-        def project(
-            payload: pl.Tensor[[capacity, input_width], pl.INT8],
-            token_scale: pl.Tensor[[capacity, 8], pl.FP32],
-            weight: pl.Tensor[[packed_rows, N_TILE], pl.INT8],
-            channel_scale: pl.Tensor[[output_width], pl.FP32],
-            output: pl.Tensor[[capacity, output_width], pl.BF16],
-            base: pl.Scalar[pl.INT32],
-            active: pl.Scalar[pl.INT32],
-        ):
-            row_blocks = (active + row_tile - 1) // row_tile
-            for block in pl.spmd(row_blocks * column_blocks, name_hint="prefill_int8_linear_full_k"):
-                row = block // column_blocks * row_tile
-                t0 = base + row
-                first_nb = block % column_blocks * column_group
-                last_nb = pl.min(first_nb + column_group, output_width // N_TILE)
-                if partial:
-                    rows = pl.min(row_tile, active - row)
+@pl.jit.inline(auto_scope=False)
+def gemm_int8_tiled(
+    payload: pl.Tensor,
+    activation_scale: pl.Tensor,
+    weight: pl.Tensor,
+    weight_scale: pl.Tensor,
+    output: pl.Tensor,
+    num_tokens: pl.Scalar[pl.INT32],
+    width: pl.constexpr,
+    output_width: pl.constexpr,
+    name_hint: pl.constexpr,
+    n_tile: pl.constexpr,
+    k_tile: pl.constexpr,
+    output_major: pl.constexpr,
+    row_tile: pl.constexpr,
+):
+    """Apply per-token and per-channel scales to an INT8 Cube product."""
+    blocks = (num_tokens + row_tile - 1) // row_tile * (output_width // n_tile)
+    workers = pl.max(1, pl.min(blocks, pl.system.available_cluster_count()))
+    for worker in pl.spmd(workers, name_hint=name_hint):
+        for block in pl.range(worker, blocks, workers):
+            row = block // (output_width // n_tile) * row_tile
+            col = block % (output_width // n_tile) * n_tile
+            valid_rows = pl.max(0, pl.min(row_tile, num_tokens - row))
+            seed = pl.tile.create([row_tile, n_tile], dtype=pl.INT32, target_memory=pl.MemorySpace.Acc, compact=True)
+            acc = pl.set_validshape(seed, valid_rows, n_tile)
+            for k0 in pl.range(0, width, k_tile):
+                a = pl.load(payload, [row, k0], [row_tile, k_tile], valid_shape=[valid_rows, k_tile])
+                if output_major:
+                    natural = pl.load(weight, [col, k0], [n_tile, k_tile], target_memory=pl.MemorySpace.Mat)
+                    transposed = pl.tile.transpose_view(natural)
+                    acc = pl.matmul_acc(acc, a, transposed, init_cond=(k0 == 0))
                 else:
-                    rows = row_tile
-                activation = pl.load(
-                    payload, [t0, 0], [row_tile, input_width], valid_shape=[rows, input_width], target_memory=pl.Mem.Mat,
-                )
-                scale_values = pl.load(token_scale, [t0, 0], [row_tile, 8], valid_shape=[rows, 8])
-                scale_scratch = pl.tile.create([row_tile, 8], dtype=pl.FP32)
-                scale = pl.row_min(scale_values, tmp_tile=scale_scratch)
-                for nb in pl.pipeline(first_nb, last_nb, stage=column_stages):
-                    n0 = nb * N_TILE
-                    packed_k0 = nb * input_width
-                    packed = pl.load(weight, [packed_k0, 0], [input_width, N_TILE], target_memory=pl.Mem.Mat)
-                    product = pl.matmul(activation, packed, out_dtype=pl.INT32)
-                    value = pl.cast(product, pl.FP32, mode="rint")
-                    channel_values = pl.load(channel_scale, [n0], [N_TILE])
-                    channels = pl.reshape(channel_values, [1, N_TILE])
-                    if combine_scales:
-                        channel_rows = pl.col_expand(value, channels)
-                        combined = pl.row_expand_mul(channel_rows, scale)
-                        scaled = pl.mul(value, combined)
-                    else:
-                        scaled_channels = pl.col_expand_mul(value, channels)
-                        scaled = pl.row_expand_mul(scaled_channels, scale)
-                    narrowed = pl.cast(scaled, pl.BF16, mode="rint")
-                    result = pl.set_validshape(narrowed, rows, N_TILE)
-                    pl.store(result, [t0, n0], output)
-            return output
+                    b = pl.load(weight, [k0, col], [k_tile, n_tile])
+                    acc = pl.matmul_acc(acc, a, b, init_cond=(k0 == 0))
+            value = pl.cast(acc, pl.FP32)
+            a_scale = pl.load(activation_scale, [row, 0], [row_tile, 1], valid_shape=[valid_rows, 1])
+            b_scale = pl.load(weight_scale, [0, col], [1, n_tile])
+            scaled = pl.row_expand_mul(value, a_scale)
+            scaled = pl.col_expand_mul(scaled, b_scale)
+            rounded = pl.cast(scaled, pl.BF16, mode="rint")
+            output = pl.store(pl.set_validshape(rounded, valid_rows, n_tile), [row, col], output)
+    return output
 
-        return project
 
-    project_rows = make_project(min(capacity, M_TILE), True)
-    project_aligned = make_project(PREFILL_QB_M_TILE, False)
+@pl.jit.inline(auto_scope=False)
+def gemm_int8(
+    payload: pl.Tensor,
+    activation_scale: pl.Tensor,
+    weight: pl.Tensor,
+    weight_scale: pl.Tensor,
+    output: pl.Tensor,
+    num_tokens: pl.Scalar[pl.INT32],
+    width: pl.constexpr,
+    output_width: pl.constexpr,
+    name_hint: pl.constexpr,
+    n_tile: pl.constexpr,
+    k_tile: pl.constexpr,
+    output_major: pl.constexpr,
+):
+    """Use larger Cube panels for densely populated projections."""
+    if num_tokens >= 32:
+        gemm_int8_tiled(payload, activation_scale, weight, weight_scale, output, num_tokens, width, output_width, name_hint, n_tile, k_tile, output_major, 32)
+    else:
+        gemm_int8_tiled(payload, activation_scale, weight, weight_scale, output, num_tokens, width, output_width, name_hint, n_tile, k_tile, output_major, 16)
+    return output
 
+
+@pl.jit.inline(auto_scope=False)
+def expert_swiglu_tiled(
+    x: pl.Tensor, factor: pl.Tensor, w1: pl.Tensor, s1: pl.Tensor,
+    w3: pl.Tensor, s3: pl.Tensor, route: pl.Tensor, hidden: pl.Tensor,
+    count: pl.Scalar[pl.INT32], width: pl.constexpr, intermediate: pl.constexpr,
+    n_tile: pl.constexpr, k_tile: pl.constexpr, limit: pl.constexpr,
+    weighted: pl.constexpr, hint: pl.constexpr, output_major: pl.constexpr, row_tile: pl.constexpr,
+):
+    """Share the activation panel between the two INT8 expert projections."""
+    panels = intermediate // n_tile
+    blocks = (count + row_tile - 1) // row_tile * panels
+    workers = pl.max(1, pl.min(blocks, pl.system.available_cluster_count()))
+    for worker in pl.spmd(workers, name_hint=hint, optimizations=[pl.cross_core_slot(slot_num=1)]):
+        for tile in pl.range(worker, blocks, workers):
+            row = tile // panels * row_tile
+            col = tile % panels * n_tile
+            rows = pl.min(row_tile, count - row)
+            gate_seed = pl.tile.create([row_tile, n_tile], dtype=pl.INT32, target_memory=pl.MemorySpace.Acc, compact=True)
+            gate_acc = pl.set_validshape(gate_seed, rows, n_tile)
+            up_seed = pl.tile.create([row_tile, n_tile], dtype=pl.INT32, target_memory=pl.MemorySpace.Acc, compact=True)
+            up_acc = pl.set_validshape(up_seed, rows, n_tile)
+            for k in pl.range(0, width, k_tile):
+                source = pl.load(x, [row, k], [row_tile, k_tile], valid_shape=[rows, k_tile])
+                if output_major:
+                    gate_nk = pl.load(w1, [col, k], [n_tile, k_tile], target_memory=pl.MemorySpace.Mat)
+                    gate_t = pl.tile.transpose_view(gate_nk)
+                    up_nk = pl.load(w3, [col, k], [n_tile, k_tile], target_memory=pl.MemorySpace.Mat)
+                    up_t = pl.tile.transpose_view(up_nk)
+                    gate_acc = pl.matmul_acc(gate_acc, source, gate_t, init_cond=(k == 0))
+                    up_acc = pl.matmul_acc(up_acc, source, up_t, init_cond=(k == 0))
+                else:
+                    gate_weights = pl.load(w1, [k, col], [k_tile, n_tile])
+                    up_weights = pl.load(w3, [k, col], [k_tile, n_tile])
+                    gate_acc = pl.matmul_acc(gate_acc, source, gate_weights, init_cond=(k == 0))
+                    up_acc = pl.matmul_acc(up_acc, source, up_weights, init_cond=(k == 0))
+            scale = pl.load(factor, [row, 0], [row_tile, 1], valid_shape=[rows, 1])
+            gate_scale = pl.load(s1, [0, col], [1, n_tile])
+            up_scale = pl.load(s3, [0, col], [1, n_tile])
+            gate_fp = pl.col_expand_mul(pl.row_expand_mul(pl.cast(gate_acc, pl.FP32), scale), gate_scale)
+            up_fp = pl.col_expand_mul(pl.row_expand_mul(pl.cast(up_acc, pl.FP32), scale), up_scale)
+            gate = pl.minimum(pl.cast(pl.cast(gate_fp, pl.BF16, mode="rint"), pl.FP32), limit)
+            up = pl.cast(pl.cast(up_fp, pl.BF16, mode="rint"), pl.FP32)
+            up = pl.minimum(pl.maximum(up, -limit), limit)
+            sigma = pl.recip(pl.add(pl.exp(pl.neg(gate)), 1.0))
+            value = pl.mul(pl.mul(gate, sigma), up)
+            if weighted:
+                coefficients = pl.load(route, [0, row], [1, row_tile], valid_shape=[1, rows])
+                value = pl.row_expand_mul(value, pl.reshape(coefficients, [row_tile, 1]))
+            result = pl.cast(value, pl.BF16, mode="rint")
+            pl.store(pl.set_validshape(result, rows, n_tile), [row, col], hidden)
+    return hidden
+
+
+@pl.jit.inline(auto_scope=False)
+def expert_swiglu(
+    x: pl.Tensor, factor: pl.Tensor, w1: pl.Tensor, s1: pl.Tensor,
+    w3: pl.Tensor, s3: pl.Tensor, route: pl.Tensor, hidden: pl.Tensor,
+    count: pl.Scalar[pl.INT32], width: pl.constexpr, intermediate: pl.constexpr,
+    n_tile: pl.constexpr, k_tile: pl.constexpr, limit: pl.constexpr,
+    weighted: pl.constexpr, hint: pl.constexpr, output_major: pl.constexpr,
+):
+    """Select a row tile for the number of tokens assigned to this expert."""
+    if count >= 32:
+        expert_swiglu_tiled(x, factor, w1, s1, w3, s3, route, hidden, count, width, intermediate, 128, k_tile, limit, weighted, hint, output_major, 32)
+    else:
+        expert_swiglu_tiled(x, factor, w1, s1, w3, s3, route, hidden, count, width, intermediate, n_tile, k_tile, limit, weighted, hint, output_major, 16)
+    return hidden
+
+
+@pl.jit.inline(auto_scope=False)
+def gemm_dynamic_int8(
+    source: pl.Tensor,
+    weight: pl.Tensor,
+    weight_scale: pl.Tensor,
+    output: pl.Tensor,
+    num_tokens: pl.Scalar[pl.INT32],
+    width: pl.constexpr,
+    output_width: pl.constexpr,
+    name_hint: pl.constexpr,
+    output_major: pl.constexpr,
+):
+    """Quantize BF16 token rows and project an INT8 weight matrix."""
+    payload, scale = quantize_activation(source, num_tokens, width)
+    return gemm_int8(payload, scale, weight, weight_scale, output, num_tokens, width, output_width, name_hint, 128, 256, output_major)
+
+
+def golden_activation_int8(source):
+    """Round the exact BF16 token/maximum ratio to even, independent of reciprocal approximations."""
+    value = source.double()
+    maximum = value.abs().amax(-1, keepdim=True).clamp_min(float(torch.tensor(127e-30)))
+    return torch.round(value * 127.0 / maximum).clamp(-127, 127).to(torch.int8)
+
+
+def golden_dynamic_int8(source, weight, scale):
+    """Evaluate symmetric per-token INT8 quantization and per-channel dequantization."""
+    value = source.float()
+    activation_scale = (value.abs().amax(-1, keepdim=True) * (1.0 / 127.0)).clamp_min(1e-30)
+    quantized = golden_activation_int8(source).long()
+    product = quantized @ weight.long()
+    return (product.float() * activation_scale * scale.float().reshape(1, -1)).bfloat16()
+
+
+@pl.jit.inline(auto_scope=False)
+def gemm_bf16_to_bf16(
+    source: pl.Tensor,
+    weight: pl.Tensor,
+    output: pl.Tensor,
+    num_tokens: pl.Scalar[pl.INT32],
+    ready: pl.Scalar[pl.TASK_ID],
+    width: pl.constexpr,
+    output_width: pl.constexpr,
+    n_tile: pl.constexpr,
+    k_tile: pl.constexpr,
+    workers: pl.constexpr,
+    name_hint: pl.constexpr,
+    source_col: pl.Scalar[pl.INT32],
+    output_col: pl.Scalar[pl.INT32],
+    ordered: pl.constexpr,
+    row_tile: pl.constexpr,
+):
+    """Project BF16 ND buffers with explicit FP32 accumulation and column offsets."""
+    blocks = (num_tokens + row_tile - 1) // row_tile * (output_width // n_tile)
+    task_workers = pl.max(pl.min(blocks, workers), 1)
+    entry_deps = pl.array.create(1, pl.TASK_ID)
+    entry_deps[0] = ready
+    with pl.spmd(task_workers, name_hint=name_hint, deps=[entry_deps[0]]) as projection_tid:
+        worker = pl.tile.get_block_idx()
+        for block in pl.range(worker, blocks, task_workers):
+            row = block // (output_width // n_tile) * row_tile
+            col = block % (output_width // n_tile) * n_tile
+            rows = pl.max(0, pl.min(row_tile, num_tokens - row))
+            if ordered:
+                ordered_acc = pl.tile.full([row_tile, n_tile], dtype=pl.FP32, value=0.0)
+                for k in pl.range(0, width, k_tile):
+                    ordered_a = pl.load(source, [row, source_col + k], [row_tile, k_tile], valid_shape=[rows, k_tile])
+                    ordered_a = pl.set_validshape(ordered_a, row_tile, k_tile)
+                    ordered_w = pl.load(weight, [k, col], [k_tile, n_tile])
+                    ordered_acc = bf16_ordered_accumulate(ordered_acc, ordered_a, ordered_w, row_tile, n_tile, k_tile)
+                rounded = pl.cast(ordered_acc, pl.BF16, mode="rint")
+                ordered_value = pl.set_validshape(rounded, rows, n_tile)
+                output = pl.store(ordered_value, [row, output_col + col], output)
+            else:
+                cube_seed = pl.tile.create([row_tile, n_tile], dtype=pl.FP32, target_memory=pl.MemorySpace.Acc, compact=True)
+                cube_acc = pl.set_validshape(cube_seed, rows, n_tile)
+                for k in pl.range(0, width, k_tile):
+                    cube_a = pl.load(source, [row, source_col + k], [row_tile, k_tile], valid_shape=[rows, k_tile])
+                    cube_w = pl.load(weight, [k, col], [k_tile, n_tile], target_memory=pl.MemorySpace.Mat)
+                    cube_acc = pl.matmul_acc(cube_acc, cube_a, cube_w, init_cond=(k == 0))
+                cube_value = pl.set_validshape(cube_acc, rows, n_tile)
+                output = pl.store(cube_value, [row, output_col + col], output)
+    return output, projection_tid
+
+
+def make_projection_validation(width):
+    """Specialize projection validation to a checkpoint's complete reduction dimension."""
     @pl.jit
-    def linear(
-        x: pl.Tensor[[capacity, input_width], pl.BF16],
-        weight: pl.Tensor[[packed_rows, N_TILE], pl.INT8],
-        channel_scale: pl.Tensor[[output_width], pl.FP32],
-        output: pl.InOut[pl.Tensor[[capacity, output_width], pl.BF16]],
-        active: pl.Scalar[pl.INT32],
+    def validate_projection(
+        source: pl.Tensor[[32, width], pl.BF16],
+        weight: pl.Tensor[[width, 128], pl.INT8],
+        scale: pl.Tensor[[1, 128], pl.FP32],
+        output: pl.Out[pl.Tensor[[32, 128], pl.BF16]],
+        quantized: pl.Out[pl.Tensor[[32, width], pl.INT8]],
+        activation_scale: pl.Out[pl.Tensor[[32, 1], pl.FP32]],
     ):
-        payload = pl.create_tensor([capacity, input_width], dtype=pl.INT8)
-        token_scale = pl.create_tensor([capacity, 8], dtype=pl.FP32)
-        quantize(x, payload, token_scale, active)
-        if qb_large_rows:
-            aligned = active // PREFILL_QB_M_TILE * PREFILL_QB_M_TILE
-            project_aligned(payload, token_scale, weight, channel_scale, output, 0, aligned)
-            project_rows(payload, token_scale, weight, channel_scale, output, aligned, active - aligned)
+        payload, factor = quantize_activation(source, 32, width)
+        for block in pl.spmd(2, name_hint="validate_quantization"):
+            row = block * 16
+            for col in pl.range(0, width, 256):
+                value = pl.load(payload, [row, col], [16, 256])
+                pl.store(value, [row, col], quantized)
+            pl.store(pl.load(factor, [row, 0], [16, 1]), [row, 0], activation_scale)
+        gemm_int8(payload, factor, weight, scale, output, 32, width, 128, "validate_int8", 64, 256, False)
+        return output, quantized, activation_scale
+    return validate_projection
+
+
+def golden_projection(tensors):
+    """Validate activation codes, FP32 factors and independently accumulated INT64 products."""
+    value = tensors["source"].float()
+    factor = (value.abs().amax(-1, keepdim=True) * (1.0 / 127.0)).clamp_min(1e-30)
+    tensors["activation_scale"].copy_(factor)
+    tensors["quantized"].copy_(golden_activation_int8(tensors["source"]))
+    tensors["output"].copy_(golden_dynamic_int8(tensors["source"], tensors["weight"], tensors["scale"]))
+
+
+@pl.jit
+def validate_bf16_dot(
+    query: pl.Tensor[[16, 512], pl.BF16],
+    keys: pl.Tensor[[128, 512], pl.BF16],
+    output: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+):
+    """Validate ordered BF16 score accumulation on one attention tile."""
+    for block in pl.spmd(1, name_hint="bf16_dot"):
+        row = block * 16
+        product = bf16_dot_sequential(query, keys, row, 0, 16, 128, 512)
+        pl.store(product, [row, 0], output)
+    return output
+
+
+def golden_bf16_dot(tensors):
+    """Evaluate the independent CPU FP32 attention score matrix."""
+    tensors["output"].copy_(tensors["query"].float() @ tensors["keys"].float().t())
+
+
+if __name__ == "__main__":
+    import argparse
+    import json
+    from pathlib import Path
+
+    from golden import TensorSpec, ratio_allclose, run
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("-p", "--platform", choices=["a2a3"], default="a2a3")
+    parser.add_argument("-d", "--device", type=int, default=0)
+    parser.add_argument("--sim", action="store_true")
+    parser.add_argument("--compile-only", action="store_true")
+    parser.add_argument("--dot-only", action="store_true")
+    parser.add_argument("--checkpoint", type=Path)
+    parser.add_argument("--report", type=Path)
+    args = parser.parse_args()
+    generator = torch.Generator().manual_seed(41)
+    stems = ["synthetic"]
+    weights = None
+    if args.checkpoint is not None:
+        from .weights import Checkpoint, ResidentWeights
+
+        weights = ResidentWeights(Checkpoint(args.checkpoint))
+        stems = ["layers.0.attn.wq_a", "layers.0.attn.wq_b", "layers.0.attn.wkv",
+                 "layers.2.attn.indexer.wq_b", "layers.0.ffn.shared_experts.w1",
+                 "layers.0.ffn.shared_experts.w3", "layers.0.ffn.shared_experts.w2",
+                 "layers.0.ffn.experts.0.w1", "layers.0.ffn.experts.383.w2"]
+    report = {"platform": args.platform, "device": args.device, "compile_only": args.compile_only, "cases": []}
+    if weights is not None:
+        report["checkpoint_identity"] = weights.checkpoint.identity
+    for stem in ([] if args.dot_only else stems):
+        if weights is None:
+            weight = torch.randint(-127, 128, (256, 128), generator=generator, dtype=torch.int8)
+            scales = torch.rand(1, 128, generator=generator) * 0.001
         else:
-            project_rows(payload, token_scale, weight, channel_scale, output, 0, active)
-        return output
-
-    return linear
-
-
-def make_ecotech_dynamic_linear(capacity, input_width, output_width, combine_scales=False):
-    """Consume prepacked INT8 weights with unchanged quantization and scaling."""
-    if capacity <= 0 or capacity % 16 or input_width % 256 or output_width % 64:
-        raise ValueError("Use a positive capacity/16, K/256 and N/64")
-    quantize = make_prefill_projection_quantize(capacity, input_width)
-    if input_width <= FULL_K_TILE:
-        return _make_full_k_dynamic_linear(capacity, input_width, output_width, combine_scales, quantize)
-    qb_columns = input_width == 1280 and output_width == 32768
-    dot = make_dot(
-        capacity, input_width, output_width, full_k_reuse=True,
-        column_group=26 if qb_columns else 1, column_stages=2 if qb_columns else 1,
+            weight, scales = weights.projection(stem)
+            columns = torch.cat((torch.arange(64), torch.arange(weight.shape[1] - 64, weight.shape[1])))
+            weight, scales = weight[:, columns].contiguous(), scales[:, columns].contiguous()
+        width = weight.shape[0]
+        source = torch.randn(32, width, generator=generator).bfloat16()
+        source[0].zero_()
+        source[1].zero_()
+        source[1, :6] = torch.tensor([254., 127., 125., -127., -125., -254.]).bfloat16()
+        print(f"A3_PROJECTION {stem} K={width}", flush=True)
+        specs = [
+            TensorSpec("source", [32, width], torch.bfloat16, init_value=source),
+            TensorSpec("weight", [width, 128], torch.int8, init_value=weight),
+            TensorSpec("scale", [1, 128], torch.float32, init_value=scales),
+            TensorSpec("output", [32, 128], torch.bfloat16),
+            TensorSpec("quantized", [32, width], torch.int8),
+            TensorSpec("activation_scale", [32, 1], torch.float32),
+        ]
+        result = run(
+            fn=make_projection_validation(width),
+            specs=specs,
+            golden_fn=golden_projection,
+            compare_fn={name: ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.0)
+                        for name in ("output", "quantized", "activation_scale")},
+            config={"backend_type": args.platform, "execution_mode": args.sim, "device_id": args.device},
+            compile_only=args.compile_only,
+        )
+        report["cases"].append({"projection": stem, "passed": result.passed, "build": str(result.work_dir)})
+        if args.report:
+            args.report.write_text(json.dumps(report, indent=2) + "\n")
+        if not result.passed:
+            raise SystemExit(result.error or 1)
+    query = torch.randn(16, 512, generator=generator).bfloat16()
+    keys = torch.randn(128, 512, generator=generator).bfloat16()
+    query[0].zero_()
+    keys[0].zero_()
+    result = run(
+        fn=validate_bf16_dot,
+        specs=[TensorSpec("query", [16, 512], torch.bfloat16, init_value=query),
+               TensorSpec("keys", [128, 512], torch.bfloat16, init_value=keys),
+               TensorSpec("output", [16, 128], torch.float32)],
+        golden_fn=golden_bf16_dot,
+        compare_fn={"output": ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.0)},
+        config={"backend_type": args.platform, "execution_mode": args.sim, "device_id": args.device},
+        compile_only=args.compile_only,
     )
-    dequantize = make_dequantize(capacity, output_width, combine_scales=combine_scales)
-
-    @pl.jit
-    def linear(
-        x: pl.Tensor[[capacity, input_width], pl.BF16],
-        weight: pl.Tensor[[input_width * (output_width // 64), 64], pl.INT8],
-        channel_scale: pl.Tensor[[output_width], pl.FP32],
-        output: pl.InOut[pl.Tensor[[capacity, output_width], pl.BF16]],
-        active: pl.Scalar[pl.INT32],
-    ):
-        payload = pl.create_tensor([capacity, input_width], dtype=pl.INT8)
-        token_scale = pl.create_tensor([capacity, 8], dtype=pl.FP32)
-        quantize(x, payload, token_scale, active)
-        accumulator = pl.create_tensor([capacity, output_width], dtype=pl.INT32)
-        dot(payload, weight, accumulator, active)
-        dequantize(accumulator, channel_scale, token_scale, output, active)
-        return output
-
-    return linear
-
-
-def padded_dimensions(input_width, output_width):
-    if type(input_width) is not int or type(output_width) is not int or input_width <= 0 or output_width <= 0:
-        raise ValueError("Require positive logical dimensions")
-    if input_width % 32 or output_width % 32:
-        raise ValueError("This tail path requires logical K/32 and N/32")
-    return ((input_width + 255) // 256) * 256, ((output_width + 63) // 64) * 64
-
-
-def prepare_ecotech_tail_weight(weight_nk, source_scale, source_offset):
-    values = (weight_nk, source_scale, source_offset)
-    if any(value.device.type != "cpu" for value in values):
-        raise ValueError("Checkpoint preprocessing requires CPU operands")
-    if weight_nk.ndim != 2 or weight_nk.dtype != torch.int8:
-        raise ValueError("Require source NK INT8 bytes")
-    output_width, input_width = weight_nk.shape
-    padded_k, padded_n = padded_dimensions(input_width, output_width)
-    for value in (source_scale, source_offset):
-        if value.shape != (output_width, 1) or value.dtype != torch.float32:
-            raise ValueError("Require original F32 [N,1] scale/offset")
-    padded_weight = torch.zeros((padded_n, padded_k), dtype=torch.int8)
-    padded_weight[:output_width, :input_width].copy_(weight_nk)
-    padded_scale = torch.ones((padded_n, 1), dtype=torch.float32)
-    padded_scale[:output_width].copy_(source_scale)
-    padded_offset = torch.zeros((padded_n, 1), dtype=torch.float32)
-    padded_offset[:output_width].copy_(source_offset)
-    return prepare_ecotech_dynamic_weight(padded_weight, padded_scale, padded_offset)
-
-
-def _make_pad_input(capacity, input_width, padded_k, input_dtype):
-    @pl.jit.inline
-    def pad_input(
-        x: pl.Tensor[[capacity, input_width], input_dtype],
-        padded: pl.Tensor[[capacity, padded_k], input_dtype],
-        active: pl.Scalar[pl.INT32],
-    ):
-        for block in pl.spmd((active + 7) // 8, name_hint="ecotech_tail_pad_input"):
-            t0 = block * 8
-            rows = pl.min(8, active - t0)
-            for k0 in pl.range(0, padded_k, 256):
-                columns = pl.min(256, input_width - k0)
-                source = pl.slice(x, [8, 256], [t0, k0], valid_shape=[rows, columns])
-                filled = pl.fillpad(source, pad_value=pl.PadValue.zero)
-                padded[t0 : t0 + 8, k0 : k0 + 256] = pl.set_validshape(filled, 8, 256)
-        return padded
-
-    return pad_input
-
-
-def _make_crop_output(capacity, output_width, padded_n):
-    @pl.jit.inline
-    def crop_output(
-        padded: pl.Tensor[[capacity, padded_n], pl.BF16],
-        output: pl.Tensor[[capacity, output_width], pl.BF16],
-        active: pl.Scalar[pl.INT32],
-    ):
-        for block in pl.spmd(
-            ((active + 7) // 8) * (output_width // 32), name_hint="ecotech_tail_crop_output"
-        ):
-            t0 = (block // (output_width // 32)) * 8
-            n0 = (block % (output_width // 32)) * 32
-            rows = pl.min(8, active - t0)
-            value = padded[t0 : t0 + 8, n0 : n0 + 32]
-            output[t0 : t0 + 8, n0 : n0 + 32] = pl.set_validshape(value, rows, 32)
-        return output
-
-    return crop_output
-
-
-def make_ecotech_tail_linear(capacity, input_width, output_width):
-    if capacity <= 0 or capacity % 16:
-        raise ValueError("Require a positive capacity/16")
-    padded_k, padded_n = padded_dimensions(input_width, output_width)
-    standalone = make_ecotech_dynamic_linear(capacity, padded_k, padded_n)
-    aligned = pl.jit.inline(standalone._func)
-
-    pad_input = _make_pad_input(capacity, input_width, padded_k, pl.BF16)
-    crop_output = _make_crop_output(capacity, output_width, padded_n)
-
-    @pl.jit
-    def linear(
-        x: pl.Tensor[[capacity, input_width], pl.BF16],
-        weight: pl.Tensor[[padded_k * (padded_n // 64), 64], pl.INT8],
-        channel_scale: pl.Tensor[[padded_n], pl.FP32],
-        output: pl.InOut[pl.Tensor[[capacity, output_width], pl.BF16]],
-        active: pl.Scalar[pl.INT32],
-    ):
-        padded_x = pl.create_tensor([capacity, padded_k], dtype=pl.BF16)
-        pad_input(x, padded_x, active)
-        padded_output = pl.create_tensor([capacity, padded_n], dtype=pl.BF16)
-        aligned(padded_x, weight, channel_scale, padded_output, active)
-        crop_output(padded_output, output, active)
-        return output
-
-    return linear
-
-
-def prepare_ecotech_token_scales(source_scale):
-    """Broadcast exact CPU F32 per-token scale bits to the eight-lane ABI."""
-    if source_scale.device.type != "cpu" or source_scale.dtype != torch.float32 or source_scale.ndim != 1:
-        raise ValueError("Require original CPU F32 per-token vector")
-    if not bool(torch.isfinite(source_scale).all()) or not bool((source_scale > 0).all()):
-        raise ValueError("Per-token scales must be finite and positive")
-    return source_scale[:, None].expand(-1, 8).contiguous()
-
-
-def make_ecotech_int8_tail_linear(capacity, input_width, output_width, *, combine_scales=False):
-    if capacity <= 0 or capacity % 16:
-        raise ValueError("Require a positive capacity/16")
-    padded_k, padded_n = padded_dimensions(input_width, output_width)
-    dot = make_dot(capacity, padded_k, padded_n)
-    dequantize = make_dequantize(capacity, padded_n, combine_scales=combine_scales)
-    pad_input = _make_pad_input(capacity, input_width, padded_k, pl.INT8)
-    crop_output = _make_crop_output(capacity, output_width, padded_n)
-
-    @pl.jit
-    def linear(
-        payload: pl.Tensor[[capacity, input_width], pl.INT8],
-        token_scale: pl.Tensor[[capacity, 8], pl.FP32],
-        weight: pl.Tensor[[padded_k * (padded_n // 64), 64], pl.INT8],
-        channel_scale: pl.Tensor[[padded_n], pl.FP32],
-        output: pl.InOut[pl.Tensor[[capacity, output_width], pl.BF16]],
-        active: pl.Scalar[pl.INT32],
-    ):
-        padded_payload = pl.create_tensor([capacity, padded_k], dtype=pl.INT8)
-        pad_input(payload, padded_payload, active)
-        accumulator = pl.create_tensor([capacity, padded_n], dtype=pl.INT32)
-        dot(padded_payload, weight, accumulator, active)
-        padded_output = pl.create_tensor([capacity, padded_n], dtype=pl.BF16)
-        dequantize(accumulator, channel_scale, token_scale, padded_output, active)
-        crop_output(padded_output, output, active)
-        return output
-
-    return linear
-
-
-def register(torch):
-    from torch.utils._python_dispatch import TorchDispatchMode
-
-    trace = []
-
-    def tensors(value):
-        if isinstance(value, torch.Tensor):
-            return [value]
-        if isinstance(value, (list, tuple)):
-            return [x for v in value for x in tensors(v)]
-        if isinstance(value, dict):
-            return [x for v in value.values() for x in tensors(v)]
-        return []
-
-    class Observe(TorchDispatchMode):
-        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
-            values = tensors((args, kwargs or {}))
-            if any(v.device.type != "npu" or v.dtype != torch.bfloat16 for v in values):
-                raise ValueError("BF16 linear dispatch reached a different device/dtype")
-            result = func(*args, **(kwargs or {}))
-            if any(v.device.type != "npu" or v.dtype != torch.bfloat16 for v in tensors(result)):
-                raise ValueError("BF16 linear dispatch returned a different device/dtype")
-            trace.append(
-                dict(
-                    op=str(func),
-                    schema=str(func._schema),
-                    inputs=[
-                        dict(
-                            shape=list(v.shape),
-                            stride=list(v.stride()),
-                            dtype=str(v.dtype),
-                            device=str(v.device),
-                        )
-                        for v in values
-                    ],
-                )
-            )
-            return result
-
-    def linear(source, weight_nk):
-        if (
-            source.device.type != "npu"
-            or weight_nk.device.type != "npu"
-            or source.dtype != torch.bfloat16
-            or weight_nk.dtype != torch.bfloat16
-            or source.ndim != 2
-            or weight_nk.ndim != 2
-            or source.shape[1] != weight_nk.shape[1]
-        ):
-            raise ValueError("Generic NPU BF16 M,K / N,K operands required")
-        with Observe():
-            return torch.ops.aten.linear.default(source, weight_nk, None)
-
-    definition = torch.library.Library(NAMESPACE, "DEF")
-    definition.define(SCHEMA)
-    implementation = torch.library.Library(NAMESPACE, "IMPL", "PrivateUse1")
-    implementation.impl("linear", linear)
-    return getattr(torch.ops, NAMESPACE).linear.default, (definition, implementation), trace
-
-
-def make_decode_bf16_linear(capacity: int, width: int, output_width: int):
-    """BF16-input/FP32-accumulate linear for compressor and Engram paths."""
-
-    if capacity % 16 or width % 256 or output_width % 32:
-        raise ValueError("BF16 linear dimensions are not A2/A3 aligned")
-    n_tile = 64 if output_width % 64 == 0 else 32
-    blocks = output_width // n_tile
-
-    @pl.jit
-    def linear(
-        value: pl.Tensor[[capacity, width], pl.BF16],
-        weight: pl.Tensor[[width, output_width], pl.BF16],
-        output: pl.InOut[pl.Tensor[[capacity, output_width], pl.BF16]],
-        active: pl.Scalar[pl.INT32],
-    ):
-        for block in pl.spmd(((active + 15) // 16) * blocks, name_hint="dsv41_a2a3_bf16_linear"):
-            t0 = (block // blocks) * 16
-            n0 = (block % blocks) * n_tile
-            rows = pl.min(16, active - t0)
-            acc = pl.create_tensor([16, n_tile], dtype=pl.FP32)
-            for k0 in pl.pipeline(0, width, 256, stage=2):
-                lhs = pl.slice(value, [16, 256], [t0, k0], valid_shape=[rows, 256])
-                lhs = pl.set_validshape(pl.fillpad(lhs, pad_value=pl.PadValue.zero), 16, 256)
-                rhs = pl.slice(weight, [256, n_tile], [k0, n0])
-                acc = pl.matmul_acc(acc, lhs, rhs, init_cond=(k0 == 0))
-            output[t0 : t0 + 16, n0 : n0 + n_tile] = pl.set_validshape(
-                pl.cast(acc, pl.BF16, mode="rint"), rows, n_tile
-            )
-        return output
-
-    return linear
-
-
-def make_decode_linear(capacity: int, width: int, output_width: int):
-    """Expose the direct canonical-weight W8A8 kernel."""
-
-    return make_decode_int8_linear_direct(capacity, width, output_width)
-
-
-def make_decode_fp32_linear(capacity: int, width: int, output_width: int):
-    """BF16-input/FP32-weight linear used by the ratio-2 compressor."""
-
-    if capacity % 16 or width % 256 or output_width % 32:
-        raise ValueError("FP32 linear dimensions are not A2/A3 aligned")
-    n_tile = 64 if output_width % 64 == 0 else 32
-    blocks = output_width // n_tile
-
-    @pl.jit
-    def linear(
-        value: pl.Tensor[[capacity, width], pl.BF16],
-        weight: pl.Tensor[[width, output_width], pl.FP32],
-        output: pl.InOut[pl.Tensor[[capacity, output_width], pl.BF16]],
-        active: pl.Scalar[pl.INT32],
-    ):
-        for block in pl.spmd(((active + 15) // 16) * blocks,
-                             name_hint="dsv41_a2a3_fp32_linear"):
-            t0 = (block // blocks) * 16
-            n0 = (block % blocks) * n_tile
-            rows = pl.min(16, active - t0)
-            acc = pl.create_tensor([16, n_tile], dtype=pl.FP32)
-            for k0 in pl.pipeline(0, width, 256, stage=2):
-                lhs = pl.slice(value, [16, 256], [t0, k0], valid_shape=[rows, 256])
-                lhs = pl.set_validshape(pl.fillpad(lhs, pad_value=pl.PadValue.zero), 16, 256)
-                rhs = pl.slice(weight, [256, n_tile], [k0, n0])
-                lhs = pl.cast(lhs, pl.FP32, mode="rint")
-                rhs = pl.cast(rhs, pl.FP32, mode="rint")
-                acc = pl.matmul_acc(acc, lhs, rhs, init_cond=(k0 == 0))
-            output[t0:t0 + 16, n0:n0 + n_tile] = pl.set_validshape(
-                pl.cast(acc, pl.BF16, mode="rint"), rows, n_tile
-            )
-        return output
-
-    return linear
-
-
-def prepare_ecotech_dynamic_weight_kn(weight_nk, source_scale, source_offset):
-    """Preprocess CPU checkpoint operands into KN INT8 and effective FP32 scales."""
-    values = (weight_nk, source_scale, source_offset)
-    if any(value.device.type != "cpu" for value in values):
-        raise ValueError("Checkpoint preprocessing requires CPU source tensors")
-    if weight_nk.ndim != 2 or weight_nk.dtype != torch.int8:
-        raise ValueError("The source weight must be a complete NK INT8 tensor")
-    output_width, input_width = weight_nk.shape
-    if input_width % 256 or output_width % 64:
-        raise ValueError("The current A2 projection requires K/256 and N/64 alignment")
-    for value in (source_scale, source_offset):
-        if value.shape != (output_width, 1) or value.dtype != torch.float32:
-            raise ValueError("Source per-channel scale and offset require FP32 [N,1]")
-        if any(not math.isfinite(item) for item in value.flatten().tolist()):
-            raise ValueError("Source scale and offset must be finite")
-    if any(item != 0 for item in source_offset.flatten().tolist()):
-        raise ValueError("The symmetric native INT8 path requires zero checkpoint offsets")
-    native_scale = source_scale.to(torch.bfloat16)
-    if any(not math.isfinite(item) or item <= 0 for item in native_scale.flatten().tolist()):
-        raise ValueError("Effective BF16 channel scales must remain finite and positive")
-    weight_kn = weight_nk.T.contiguous()
-    channel_scale = native_scale.to(torch.float32).flatten()
-    return weight_kn, channel_scale
-
-
-def make_ecotech_dynamic_linear_kn(capacity, input_width, output_width, combine_scales=False):
-    """Compose existing INT8 quantization, full matmul and FP32 scale operators."""
-    if capacity <= 0 or capacity % 16 or input_width % 256 or output_width % 64:
-        raise ValueError("Use a positive capacity/16, K/256 and N/64")
-    packed_rows = input_width * (output_width // 64)
-    pack = make_blocked_weight_pack(input_width, output_width)
-    quantize = make_quantize(capacity, input_width)
-    dot = make_dot(capacity, input_width, output_width)
-    dequantize = make_dequantize(capacity, output_width, combine_scales=combine_scales)
-
-    @pl.jit
-    def linear(
-        x: pl.Tensor[[capacity, input_width], pl.BF16],
-        weight: pl.Tensor[[input_width, output_width], pl.INT8],
-        channel_scale: pl.Tensor[[output_width], pl.FP32],
-        output: pl.InOut[pl.Tensor[[capacity, output_width], pl.BF16]],
-        active: pl.Scalar[pl.INT32],
-    ):
-        packed = pl.create_tensor([packed_rows, 64], dtype=pl.INT8)
-        pack(weight, packed)
-        payload = pl.create_tensor([capacity, input_width], dtype=pl.INT8)
-        token_scale = pl.create_tensor([capacity, 8], dtype=pl.FP32)
-        quantize(x, payload, token_scale, active)
-        accumulator = pl.create_tensor([capacity, output_width], dtype=pl.INT32)
-        dot(payload, packed, accumulator, active)
-        dequantize(accumulator, channel_scale, token_scale, output, active)
-        return output
-
-    return linear
-
-
-def prepare_ecotech_tail_weight_kn(weight_nk, source_scale, source_offset):
-    values = (weight_nk, source_scale, source_offset)
-    if any(value.device.type != "cpu" for value in values):
-        raise ValueError("Checkpoint preprocessing requires CPU operands")
-    if weight_nk.ndim != 2 or weight_nk.dtype != torch.int8:
-        raise ValueError("Require source NK INT8 bytes")
-    output_width, input_width = weight_nk.shape
-    padded_k, padded_n = padded_dimensions(input_width, output_width)
-    for value in (source_scale, source_offset):
-        if value.shape != (output_width, 1) or value.dtype != torch.float32:
-            raise ValueError("Require original F32 [N,1] scale/offset")
-    padded_weight = torch.zeros((padded_n, padded_k), dtype=torch.int8)
-    padded_weight[:output_width, :input_width].copy_(weight_nk)
-    padded_scale = torch.ones((padded_n, 1), dtype=torch.float32)
-    padded_scale[:output_width].copy_(source_scale)
-    padded_offset = torch.zeros((padded_n, 1), dtype=torch.float32)
-    padded_offset[:output_width].copy_(source_offset)
-    return prepare_ecotech_dynamic_weight_kn(padded_weight, padded_scale, padded_offset)
-
-
-def make_ecotech_tail_linear_kn(capacity, input_width, output_width):
-    if capacity <= 0 or capacity % 16:
-        raise ValueError("Require a positive capacity/16")
-    padded_k, padded_n = padded_dimensions(input_width, output_width)
-    standalone = make_ecotech_dynamic_linear_kn(capacity, padded_k, padded_n)
-    aligned = pl.jit.inline(standalone._func)
-
-    pad_input = _make_pad_input(capacity, input_width, padded_k, pl.BF16)
-    crop_output = _make_crop_output(capacity, output_width, padded_n)
-
-    @pl.jit
-    def linear(
-        x: pl.Tensor[[capacity, input_width], pl.BF16],
-        weight: pl.Tensor[[padded_k, padded_n], pl.INT8],
-        channel_scale: pl.Tensor[[padded_n], pl.FP32],
-        output: pl.InOut[pl.Tensor[[capacity, output_width], pl.BF16]],
-        active: pl.Scalar[pl.INT32],
-    ):
-        padded_x = pl.create_tensor([capacity, padded_k], dtype=pl.BF16)
-        pad_input(x, padded_x, active)
-        padded_output = pl.create_tensor([capacity, padded_n], dtype=pl.BF16)
-        aligned(padded_x, weight, channel_scale, padded_output, active)
-        crop_output(padded_output, output, active)
-        return output
-
-    return linear
-
-
-def make_ecotech_int8_tail_linear_kn(capacity, input_width, output_width, *, combine_scales=False):
-    if capacity <= 0 or capacity % 16:
-        raise ValueError("Require a positive capacity/16")
-    padded_k, padded_n = padded_dimensions(input_width, output_width)
-    packed_rows = padded_k * (padded_n // 64)
-    pack = make_blocked_weight_pack(padded_k, padded_n)
-    dot = make_dot(capacity, padded_k, padded_n)
-    dequantize = make_dequantize(capacity, padded_n, combine_scales=combine_scales)
-    pad_input = _make_pad_input(capacity, input_width, padded_k, pl.INT8)
-    crop_output = _make_crop_output(capacity, output_width, padded_n)
-
-    @pl.jit
-    def linear(
-        payload: pl.Tensor[[capacity, input_width], pl.INT8],
-        token_scale: pl.Tensor[[capacity, 8], pl.FP32],
-        weight: pl.Tensor[[padded_k, padded_n], pl.INT8],
-        channel_scale: pl.Tensor[[padded_n], pl.FP32],
-        output: pl.InOut[pl.Tensor[[capacity, output_width], pl.BF16]],
-        active: pl.Scalar[pl.INT32],
-    ):
-        padded_payload = pl.create_tensor([capacity, padded_k], dtype=pl.INT8)
-        pad_input(payload, padded_payload, active)
-        packed = pl.create_tensor([packed_rows, 64], dtype=pl.INT8)
-        pack(weight, packed)
-        accumulator = pl.create_tensor([capacity, padded_n], dtype=pl.INT32)
-        dot(padded_payload, packed, accumulator, active)
-        padded_output = pl.create_tensor([capacity, padded_n], dtype=pl.BF16)
-        dequantize(accumulator, channel_scale, token_scale, padded_output, active)
-        crop_output(padded_output, output, active)
-        return output
-
-    return linear
+    report["cases"].append({"projection": "bf16_attention_dot", "passed": result.passed, "build": str(result.work_dir)})
+    if args.report:
+        args.report.write_text(json.dumps(report, indent=2) + "\n")
+    if not result.passed:
+        raise SystemExit(result.error or 1)
