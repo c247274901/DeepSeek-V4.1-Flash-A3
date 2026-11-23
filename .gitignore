@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+*.so
+.venv/
+.pytest_cache/
+.ruff_cache/
+build_output/
+evidence/
+.workspace/
+repos/
+*.log
+report.html
