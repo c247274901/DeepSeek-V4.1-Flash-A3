@@ -67,7 +67,7 @@ resident programs. The model history preserves individual optimization,
 correctness and revert commits with original author and source SHA.
 
 Architecture baselines, operator comparisons, and export instructions for
-Blueprint and the Playground web report are in the [task catalog](tasks/README.md).
+Blueprint and the Playground web report are in the [task catalog](docs/blueprint/README.md).
 
 The 8192-row Prefill graph (MoE slab 128) and the 16-row Decode graph
 compiled for A3 at context capacity 8200. Host tests cover the serving routes

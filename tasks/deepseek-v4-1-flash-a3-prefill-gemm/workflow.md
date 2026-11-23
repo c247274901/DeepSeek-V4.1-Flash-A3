@@ -16,7 +16,7 @@ its native Torch golden or an independent reference.
 Use three paired timing windows with five warmups and 100
 measured calls per window. Keep compilation, checkpoint load and profiling
 outside the timing. Store the raw samples and validate the paired runs using
-the [evidence format](../README.md).
+the [evidence format](../../docs/blueprint/README.md).
 
 ```bash
 python3 modules/artifact-harness/tools/compare.py \
