@@ -222,7 +222,7 @@ def quantize_index_query(
                 pl.store(bf16_result, [t, 0], output)
             else:
                 stored_values = packed_input
-                fp8_result = encode_fp8(stored_values, 1, INDEX_QUERY_WIDTH)
+                fp8_result = encode_fp8(stored_values, 1, INDEX_QUERY_WIDTH, integer_bits=False)
                 pl.store(fp8_result, [t, 0], output)
             codes = pl.cast(pl.reshape(exponent, [1, INDEX_QUERY_SCALE_WIDTH]), pl.UINT8)
             pl.store(codes, [t, 0], output_scale)

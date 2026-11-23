@@ -10,12 +10,12 @@
 
 
 import pypto.language as pl
-from .gemm import quantize_activation
+from .activation_quant import quantize_projection_activation
 import pypto.language.distributed as pld
 from .sparse_attention import (
     SWA_RUN_DESCRIPTOR_WIDTH as RUN_DESCRIPTOR_WIDTH, SWA_RUN_PARTS as RUN_PARTS,
     analyze_index_runs, attend_shared_cache, decode_shared_cache_after_publish,
-    prefill_publish_window_batched,
+    prefill_publish_window,
 )
 from .config import (
     WINDOW_CACHE_GROUP, FLASH as M, ORI_BLOCKS_DYN, T_DYN, TP_SIZE, PREFILL_MAX_TOKENS,
@@ -25,7 +25,7 @@ from .hc import prefill_sp_post
 from .hc import hc_pre, zero_bf16_padding
 from .rmsnorm import rms_norm_tiled
 from .qkv_proj_rope import q_proj_rope, kv_proj_rope
-from .o_proj import retire_prefill_signals, project_output, prefill_sp_output_reduce_scatter
+from .o_proj import o_proj, prefill_sp_output_reduce_scatter, retire_prefill_signals
 from .prefill_cp_allgather import make_prefill_sp_input_allgather
 
 
@@ -92,7 +92,7 @@ def prefill_swa_attention(
         for row in pl.range(worker, num_tokens, WORKER_TILE):
             kv_projection[row : row + 1, :] = pl.full([1, HEAD_DIM], dtype=pl.BF16, value=0.0)
     kv = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-    kv_input_payload, kv_input_scales = quantize_activation(x, num_tokens, D)
+    kv_input_payload, kv_input_scales = quantize_projection_activation(x, num_tokens, D, True, True)
     kv_proj_rope(
         kv_input_payload, kv_input_scales,
         wkv, wkv_scale, kv_norm_weight,
@@ -100,7 +100,7 @@ def prefill_swa_attention(
         kv_projection, kv,
         num_tokens,
     )
-    chunk_done = prefill_publish_window_batched(kv, window_slots, window_cache, window_cache_scale, num_tokens, cache_ready)
+    chunk_done = prefill_publish_window(kv, window_slots, window_cache, window_cache_scale, num_tokens, cache_ready)
     cache_blocks = pl.tensor.dim(window_cache, 0)
     cache_rows = cache_blocks * 128
     decoded_cache = pl.create_tensor([cache_blocks, 128, 1, HEAD_DIM], dtype=pl.BF16)
@@ -151,9 +151,7 @@ def prefill_swa_attention(
             descriptors, chunk_indices, attn_sink,
             attended, active, decoded_ready, index_ready,
         )
-        project_output(
-            attended, wo_a, wo_b, chunk_cos, chunk_sin, chunk_partial, active, True,
-        )
+        o_proj(attended, wo_a, wo_b, chunk_cos, chunk_sin, chunk_partial, active)
         with pl.spmd(WORKER_TILE, name_hint="prefill_swa_collect") as collect_tid:
             worker = pl.tile.get_block_idx()
             for row in pl.range(worker, active, WORKER_TILE):

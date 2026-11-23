@@ -52,12 +52,13 @@ HC_DIM = M.hc_dim
 O_A_N_TILE = 128
 O_B_N_TILE = 128
 K_TILE = 128
-D_TILE = 512
+PREFILL_O_M_TILE = 128
+PREFILL_O_N_TILE = 256
 TP_COLUMNS = 1280
-TP_ROWS = 4 if MOE_TOKENS >= 64 else 1
+TP_ROWS = 8 if MOE_TOKENS >= 64 else 1
 
 rotate_output = make_pipelined_rope(
-    T_DYN, LOCAL_H, HEAD_DIM, inverse=True, name_hint="inverse_rope_o", allow_early_resolve=False,
+    T_DYN, LOCAL_H, HEAD_DIM, inverse=True, name_hint="inverse_rope_o", allow_early_resolve=False, inplace=True,
 )
 
 
@@ -73,12 +74,12 @@ def make_project_output(*, prefill):
         num_tokens: pl.Scalar[pl.INT32],
         sequential: pl.constexpr,
     ):
-        """Apply inverse RoPE and grouped BF16 O-A/O-B projections."""
+        """Apply inverse RoPE and grouped BF16 O-A/O-B projections. Prefill consumes attention scratch."""
         tokens = pl.tensor.dim(output, 0)
-        rotated = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
         if prefill:
-            rotated = rotate_output(attended, rope_cos, rope_sin, rotated, num_tokens)
+            rotated = rotate_output(attended, rope_cos, rope_sin, attended, num_tokens)
         else:
+            rotated = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
             rotated = _rotate_rope(
                 attended, rotated, rope_cos, rope_sin, 0, num_tokens, LOCAL_H, HEAD_DIM, "inverse_rope_o", True, True,
             )
@@ -87,20 +88,40 @@ def make_project_output(*, prefill):
         for group in pl.parallel(LOCAL_O_GROUPS):
             source_col = pl.cast(group * O_GROUP_IN, pl.INT32)
             output_col = pl.cast(group * O_LORA, pl.INT32)
-            if not sequential and num_tokens >= 64:
+            if prefill and not sequential and num_tokens >= PREFILL_O_M_TILE:
                 gemm_bf16_to_bf16(
                     rotated, wo_a[group], projected, num_tokens, ready,
-                    O_GROUP_IN, O_LORA, 256, 128, 24, "proj_o_a", source_col, output_col, False, 64, stages=1,
+                    O_GROUP_IN, O_LORA, PREFILL_O_N_TILE, K_TILE, 24, "proj_o_a",
+                    source_col, output_col, False, PREFILL_O_M_TILE, stages=2,
+                )
+            elif not sequential and num_tokens >= 64:
+                gemm_bf16_to_bf16(
+                    rotated, wo_a[group], projected, num_tokens, ready,
+                    O_GROUP_IN, O_LORA, 256, K_TILE, 24, "proj_o_a",
+                    source_col, output_col, False, 64, stages=1,
                 )
             else:
                 gemm_bf16_to_bf16(
                     rotated, wo_a[group], projected, num_tokens, ready,
-                    O_GROUP_IN, O_LORA, O_A_N_TILE, K_TILE, 48 if sequential else 24, "proj_o_a", source_col, output_col, sequential, 16, stages=1,
+                    O_GROUP_IN, O_LORA, O_A_N_TILE, K_TILE, 48 if sequential else 24, "proj_o_a",
+                    source_col, output_col, sequential, 16, stages=1,
                 )
-        if not sequential and num_tokens >= 64:
-            gemm_bf16_to_bf16(projected, wo_b, output, num_tokens, ready, LOCAL_O_WIDTH, D, 256, 128, 24, "proj_o_b", 0, 0, False, 64, stages=1)
+        if prefill and not sequential and num_tokens >= PREFILL_O_M_TILE:
+            gemm_bf16_to_bf16(
+                projected, wo_b, output, num_tokens, ready,
+                LOCAL_O_WIDTH, D, PREFILL_O_N_TILE, K_TILE, 24, "proj_o_b", 0, 0, False, PREFILL_O_M_TILE, stages=2,
+            )
+        elif not sequential and num_tokens >= 64:
+            gemm_bf16_to_bf16(
+                projected, wo_b, output, num_tokens, ready,
+                LOCAL_O_WIDTH, D, 256, K_TILE, 24, "proj_o_b", 0, 0, False, 64, stages=1,
+            )
         else:
-            gemm_bf16_to_bf16(projected, wo_b, output, num_tokens, ready, LOCAL_O_WIDTH, D, O_B_N_TILE, K_TILE, 48 if sequential else 24, "proj_o_b", 0, 0, sequential, 16, stages=1)
+            gemm_bf16_to_bf16(
+                projected, wo_b, output, num_tokens, ready,
+                LOCAL_O_WIDTH, D, O_B_N_TILE, K_TILE, 48 if sequential else 24, "proj_o_b",
+                0, 0, sequential, 16, stages=1,
+            )
         return output
 
     return project_output
@@ -181,57 +202,11 @@ def prefill_sp_output_reduce_scatter(
 ):
     """Sum BF16 head-TP contributions in FP32 for this rank's token rows."""
     local_tokens = pl.tensor.dim(output, 0)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="sp_reduce_reuse", allow_early_resolve=False) as reuse_tid:
-        for peer in pl.range(TP_SIZE):
-            pld.system.wait(
-                output_arrived,
-                offsets=[peer, 0], expected=(attention_epoch - 1) * 2, cmp=pld.WaitCmp.Ge,
-            )
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="sp_reduce_publish", deps=[reuse_tid]) as publish_tid:
-        if num_tokens > 0:
-            pld.tensor.put(
-                dst=output_window, peer=group_base + tp_rank, src=partial,
-                dst_offsets=[0, 0], src_offsets=[0, 0], shape=[num_tokens, D],
-                chunk_rows=1, chunk_cols=D_TILE, pipeline=True,
-            )
-        for peer in pl.range(TP_SIZE):
-            pld.system.notify(
-                output_arrived,
-                peer=group_base + peer, offsets=[tp_rank, 0], value=1, op=pld.NotifyOp.AtomicAdd,
-            )
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="sp_reduce_wait", deps=[publish_tid],
-               allow_early_resolve=False) as wait_tid:
-        for peer in pl.range(TP_SIZE):
-            pld.system.wait(output_arrived, offsets=[peer, 0], expected=attention_epoch * 2 - 1, cmp=pld.WaitCmp.Ge)
-    with pl.spmd(64, name_hint="sp_reduce_scatter", deps=[wait_tid]) as reduce_tid:
-        worker = pl.tile.get_block_idx()
-        for tile in pl.range(worker, local_tokens * (D // D_TILE), 64):
-            local_row = tile // (D // D_TILE)
-            col = tile % (D // D_TILE) * D_TILE
-            row = tp_rank * local_tokens + local_row
-            acc = pl.tile.full([1, D_TILE], dtype=pl.FP32, value=0.0)
-            if row < num_tokens:
-                for peer in pl.range(TP_SIZE):
-                    value = pld.tile.remote_load(
-                        output_window,
-                        peer=group_base + peer, offsets=[row, col], shape=[1, D_TILE],
-                    )
-                    acc = pl.add(acc, pl.cast(value, pl.FP32))
-            result = pl.cast(acc, pl.BF16, mode="rint")
-            output = pl.store(result, [local_row, col], output)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="sp_reduce_release", deps=[reduce_tid]) as release_tid:
-        for peer in pl.range(TP_SIZE):
-            pld.system.notify(
-                output_arrived,
-                peer=group_base + peer, offsets=[tp_rank, 0], value=1, op=pld.NotifyOp.AtomicAdd,
-            )
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="sp_reduce_consumed", deps=[release_tid],
-               allow_early_resolve=False):
-        for peer in pl.range(TP_SIZE):
-            pld.system.wait(output_arrived, offsets=[peer, 0], expected=attention_epoch * 2, cmp=pld.WaitCmp.Ge)
-        anchor = pl.read(output, [0, 0])
-        pl.write(output, [0, 0], anchor)
-    return output
+    output_offset = pl.cast(tp_rank * local_tokens, pl.INDEX)
+    return _tp_output_all_reduce(
+        partial, output_window, output_arrived, output, group_base, tp_rank,
+        num_tokens, attention_epoch, output_offset, False, TP_ROWS,
+    )
 
 
 @pl.jit.inline(auto_scope=False)
@@ -248,7 +223,7 @@ def prefill_tp_output_all_reduce(
 ):
     return _tp_output_all_reduce(
         output_partial, output_window, output_arrived, output, group_base, tp_rank,
-        num_tokens, attention_epoch, owner_rows, 1 if owner_rows else TP_ROWS,
+        num_tokens, attention_epoch, pl.cast(0, pl.INDEX), owner_rows, 1 if owner_rows else TP_ROWS,
     )
 
 
@@ -257,15 +232,16 @@ def _tp_output_all_reduce(
     output_partial: pl.Tensor[[T_DYN, D], pl.BF16],
     output_window: pld.DistributedTensor,
     output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
-    output: pl.Tensor[[T_DYN, D], pl.BF16],
+    output: pl.Tensor,
     group_base: pl.Scalar[pl.INT32],
     tp_rank: pl.Scalar[pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
     attention_epoch: pl.Scalar[pl.INT32],
+    output_offset: pl.Scalar[pl.INDEX],
     owner_rows: pl.constexpr,
     tile_rows: pl.constexpr,
 ):
-    """Publish TP partials or uniquely owned MoE rows, then restore the replicated stream."""
+    """Publish TP partials or owned rows and read the destination token range."""
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_tp_reuse", allow_early_resolve=False) as reuse_tid:
         for peer in pl.range(TP_SIZE):
             previous_epoch = (attention_epoch - 1) * 2
@@ -305,7 +281,8 @@ def _tp_output_all_reduce(
         worker = pl.tile.get_block_idx()
         output_rows = pl.tensor.dim(output, 0)
         for tile in pl.range(worker, (output_rows + tile_rows - 1) // tile_rows * column_tiles, 64):
-            row = tile // column_tiles * tile_rows
+            local_row = tile // column_tiles * tile_rows
+            row = output_offset + local_row
             col = tile % column_tiles * TP_COLUMNS
             acc = pl.tile.full([tile_rows, TP_COLUMNS], dtype=pl.FP32, value=0.0)
             if row < num_tokens:
@@ -314,18 +291,26 @@ def _tp_output_all_reduce(
                     owned = pld.tile.remote_load(output_window, peer=owner, offsets=[row, col], shape=[1, TP_COLUMNS])
                     acc = pl.add(acc, pl.cast(owned, pl.FP32))
                 else:
-                    live = pl.min(tile_rows, num_tokens - row)
-                    for peer in pl.range(TP_SIZE):
-                        value = pld.tile.remote_load(
-                            output_window, peer=group_base + peer, offsets=[row, col],
-                            shape=[tile_rows, TP_COLUMNS], valid_shape=[live, TP_COLUMNS],
-                        )
-                        filled = pl.fillpad(value, pad_value=pl.PadValue.zero)
-                        full = pl.set_validshape(filled, tile_rows, TP_COLUMNS)
-                        acc = pl.add(acc, pl.cast(full, pl.FP32))
+                    live = pl.min(tile_rows, pl.min(num_tokens - row, output_rows - local_row))
+                    if live == tile_rows:
+                        for peer in pl.range(TP_SIZE):
+                            value = pld.tile.remote_load(
+                                output_window, peer=group_base + peer, offsets=[row, col],
+                                shape=[tile_rows, TP_COLUMNS],
+                            )
+                            acc = pl.add(acc, pl.cast(value, pl.FP32))
+                    else:
+                        for peer in pl.range(TP_SIZE):
+                            tail = pld.tile.remote_load(
+                                output_window, peer=group_base + peer, offsets=[row, col],
+                                shape=[tile_rows, TP_COLUMNS], valid_shape=[live, TP_COLUMNS],
+                            )
+                            filled = pl.fillpad(tail, pad_value=pl.PadValue.zero)
+                            full = pl.set_validshape(filled, tile_rows, TP_COLUMNS)
+                            acc = pl.add(acc, pl.cast(full, pl.FP32))
             result = pl.cast(acc, pl.BF16, mode="rint")
-            extent = pl.min(tile_rows, output_rows - row)
-            output = pl.store(pl.set_validshape(result, extent, TP_COLUMNS), [row, col], output)
+            extent = pl.min(tile_rows, output_rows - local_row)
+            output = pl.store(pl.set_validshape(result, extent, TP_COLUMNS), [local_row, col], output)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_tp_release", deps=[reduce_tid]) as release_tid:
         for peer in pl.range(TP_SIZE):
             pld.system.notify(
@@ -352,7 +337,12 @@ def l2_o_proj(
     output: pl.InOut[pl.Tensor[[32, D], pl.BF16]],
 ):
     num_tokens = pl.read(counts, [0])
-    o_proj(attended, wo_a, wo_b, rope_cos, rope_sin, output, num_tokens)
+    # Match the Prefill producer's writable scratch while keeping the replay input reusable.
+    scratch = pl.create_tensor([32, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
+    for block in pl.spmd(32, name_hint="o_proj_validation_input"):
+        row = pl.load(attended, [block, 0], [1, LOCAL_H * HEAD_DIM])
+        pl.store(row, [block, 0], scratch)
+    o_proj(scratch, wo_a, wo_b, rope_cos, rope_sin, output, num_tokens)
     return output
 
 

@@ -64,7 +64,7 @@ from .config import (
 
 from .hc import hc_post
 from .hc import hc_head, hc_pre, zero_bf16_padding
-from .input_pack import gather_rows, pack_x_hc, prepare_compressed_lens
+from .input_pack import HIDDEN_TILE, gather_rows, pack_x_hc, prepare_compressed_lens
 from .rope_tables import ROPE_ROWS_DYN, materialize_rope_rows
 from .engram import ENGRAM_K, KV_OUT, engram_from_rows
 from .lm_head import GROUP_LOGIT_ROWS, final_output
@@ -78,7 +78,7 @@ from .prefill_c2a_full import prefill_c2a_full_attention
 from .prefill_c2a_reuse import prefill_c2a_reuse_attention
 from .prefill_c1a_reindex import prefill_c1a_reindex_attention
 from .prefill_c1a_reuse import prefill_c1a_reuse_attention
-from .rmsnorm import rms_norm_tiled
+from .rmsnorm import prefill_rms_norm
 
 RANKS = C.EP_SIZE
 D = M.hidden_size
@@ -542,8 +542,8 @@ def l2_prefill_fwd(
     else:
         replay_hidden = pl.reshape(x_hc_out, [CAPACITY, HC_DIM])
         replay_initial = pl.reshape(initial_hidden, [CAPACITY, HC_DIM])
-        gather_rows(replay_hidden, identity_rows, replay_initial, gather_ready)
-    gather_rows(initial_pre, identity_rows, initial_mix, gather_ready)
+        gather_rows(replay_hidden, identity_rows, replay_initial, gather_ready, D)
+    gather_rows(initial_pre, identity_rows, initial_mix, gather_ready, HIDDEN_TILE)
     # Reuse bounded MoE slabs across all layers and rounds.
     attn_hidden = attn_hc_out
     attn_pre = pl.create_tensor([CAPACITY, HC_MULT], dtype=pl.FP32)
@@ -621,11 +621,7 @@ def l2_prefill_fwd(
                 encoder_normalized = pl.create_tensor([CAPACITY, D], dtype=pl.BF16)
                 hc_head(encoder_hidden, encoder_pre, encoder_collapsed)
                 norm_tokens = pl.tensor.dim(encoder_collapsed, 0)
-                for norm_block in pl.spmd((norm_tokens + 7) // 8, name_hint="rms_norm"):
-                    rms_norm_tiled(
-                        encoder_collapsed, layer_attn_norm, encoder_normalized, norm_block, norm_tokens,
-                        output_fp32=False,
-                    )
+                prefill_rms_norm(encoder_collapsed, layer_attn_norm, encoder_normalized, norm_tokens)
                 publisher_ready = prefill_publish_decoder(
                     encoder_normalized, c1a_compressor_wkv, layer_compressor_norm, layer_index_wk, layer_index_norm,
                     rope_cos[1], rope_sin[1], c1a_compressed_slots,
@@ -634,8 +630,8 @@ def l2_prefill_fwd(
                 )
                 gathered_hidden = pl.reshape(hidden, [CAPACITY, HC_DIM])
                 source_hidden = pl.reshape(encoder_hidden, [CAPACITY, HC_DIM])
-                gather_rows(source_hidden, replay_rows, gathered_hidden, publisher_ready)
-                gather_rows(encoder_pre, replay_rows, delayed_pre, publisher_ready)
+                gather_rows(source_hidden, replay_rows, gathered_hidden, publisher_ready, D)
+                gather_rows(encoder_pre, replay_rows, delayed_pre, publisher_ready, HIDDEN_TILE)
         # Empty source rounds consume zeros. Materialize the observable attention output on the final layer.
         if active > 0 or layer + 1 == last_layer:
             if layer == 1 or layer == 14:
@@ -655,8 +651,7 @@ def l2_prefill_fwd(
                     collapsed, attn_pre, attn_post, attn_residual,
                 )
                 norm_tokens = pl.tensor.dim(collapsed, 0)
-                for norm_block in pl.spmd((norm_tokens + 7) // 8, name_hint="rms_norm"):
-                    rms_norm_tiled(collapsed, layer_attn_norm, normalized, norm_block, norm_tokens, output_fp32=False)
+                prefill_rms_norm(collapsed, layer_attn_norm, normalized, norm_tokens)
                 mode = 0
                 cache_slot = 0
                 rope_slot = 0
@@ -686,6 +681,7 @@ def l2_prefill_fwd(
                 else:
                     zero_bf16_padding(attn_output, pl.cast(0, pl.INT32))
                 hc_post_deps = pl.array.create(2, pl.TASK_ID)
+                hc_post_deps[0] = moe_ready
                 hc_post(attn_output, hidden, attn_post, attn_residual, attn_hidden, deps=hc_post_deps)
         moe_ready = _prefill_moe(
             attn_hidden, attn_pre, layer_ffn_fn, layer_ffn_scale, layer_ffn_base, layer_ffn_norm, layer_gate_weight, layer_gate_bias,
@@ -704,8 +700,8 @@ def l2_prefill_fwd(
     final_pre = pl.slice(pre_pair, [CAPACITY, HC_MULT], [final_slot, 0])
     source_hidden = pl.reshape(final_hidden, [CAPACITY, HC_DIM])
     output_hidden = pl.reshape(x_hc_out, [CAPACITY, HC_DIM])
-    gather_rows(source_hidden, identity_rows, output_hidden, gather_ready)
-    gather_rows(final_pre, identity_rows, pre_mix_out, gather_ready)
+    gather_rows(source_hidden, identity_rows, output_hidden, gather_ready, D)
+    gather_rows(final_pre, identity_rows, pre_mix_out, gather_ready, HIDDEN_TILE)
     retire_prefill_signals(x_hc_out, ffn_arrived, rank // TP_SIZE * TP_SIZE, rank % TP_SIZE)
     clear_moe_signals(x_hc_out, arrived, data_arrived, combine_arrived, anchor_indices=(0, 0, 0))
     retire_prefill_signals(x_hc_out, attention_arrived, rank // TP_SIZE * TP_SIZE, rank % TP_SIZE)
