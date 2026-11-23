@@ -23,16 +23,18 @@ first generated token. Each subsequent token takes one Decode call.
 
 ## Compile and run
 
-From the repository root, compile into fresh directories. Prefill capacity
+From the `pypto-serving-deepseek-v4.1-flash-a3/` directory, compile into fresh directories. Prefill capacity
 must be a multiple of 16 in 16..8192. Both phases need the same history
 capacity, including reserved output positions.
 
 ```bash
 model=models.deepseek_v4_1_flash_a3
 python -m "$model.prefill_fwd" --compile-only --capacity 128 \
-  --context-capacity 256 --output "$GRAPH_DIR/prefill"
+  --prefill-moe-slab-rows 128 --context-capacity 256 --prepare-windows \
+  --output "$GRAPH_DIR/prefill"
 python -m "$model.decode_fwd" --compile-only \
-  --context-capacity 256 --output "$GRAPH_DIR/decode"
+  --decode-capacity 16 --context-capacity 256 --prepare-windows \
+  --output "$GRAPH_DIR/decode"
 ```
 
 Run generation in a 16-device allocation. The driver checks the artifact
@@ -41,7 +43,8 @@ inputs for each call.
 
 ```bash
 python -m "$model.generate" --checkpoint "$CHECKPOINT" --devices "$TASK_DEVICE" \
-  --graph-dir "$GRAPH_DIR" --tokens 42,43 --max-new-tokens 2 --ignore-eos \
+  --graph-dir "$GRAPH_DIR" --prefill-moe-slab-rows 128 \
+  --tokens 42,43 --max-new-tokens 2 --ignore-eos \
   --output "$RUN_DIR"
 ```
 
@@ -56,18 +59,24 @@ windows. For reusable generation artifacts, add `--prepare-windows` to both
 vocabulary vector for each emitted token.
 
 For the bundled 8192-token replay, build Prefill with `--capacity 8192`
-and `--prefill-moe-slab-rows 2048`, Decode with `--decode-capacity 16`, and both
-programs with `--context-capacity 8200`. Run the compiled pair with
+and `--prefill-moe-slab-rows 128`, Decode with `--decode-capacity 16`, and both
+programs with `--context-capacity 8200 --prepare-windows`. Run the compiled pair with
 
 ```bash
 python -m "$model.prefill_fwd" --checkpoint "$CHECKPOINT" --devices "$TASK_DEVICE" \
   --runtime-dir "$GRAPH_DIR/prefill" --decode-runtime-dir "$GRAPH_DIR/decode" \
   --input-ids-json models/deepseek_v4_1_flash_a3/input_ids.json \
-  --prefill-moe-slab-rows 2048 --chunk-size 8192 --max-new-tokens 8 --ignore-eos --output "$RUN_DIR"
+  --prefill-moe-slab-rows 128 --chunk-size 8192 --max-new-tokens 8 --ignore-eos --output "$RUN_DIR"
 ```
 
-## Validate logits
+## Source files
 
-The accuracy collector uses the same Prefill and Decode entry points as generation.
-It feeds the prepared trace token into each Decode step and records full-vocabulary
-FP32 logits.
+- `prefill_fwd.py` and `decode_fwd.py` own the phase schedules. The adjacent
+  kernels implement projections, attention, Indexer, mHC, Engram and MoE.
+- `driver.py` builds both graphs and verifies the manifests. `generation.py`
+  and `replay.py` keep the weights, caches and communication windows resident.
+- `config.py` defines the topology and geometry. `weights.py`, `host.py` and
+  `utils.py` load the checkpoint and prepare the tensors passed to the graphs.
+
+Run the CPU Decode regression from the serving package directory with
+`python -m pytest -q tests/test_decode_staging.py`.

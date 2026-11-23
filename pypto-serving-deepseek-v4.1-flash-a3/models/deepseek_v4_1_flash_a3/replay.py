@@ -12,7 +12,7 @@ import dataclasses
 import json
 import time
 
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import CancelledError, ThreadPoolExecutor
 
 import numpy as np
 import torch
@@ -105,6 +105,7 @@ def run_request(
     weights, engram, tokenizer, request, host_cache, rope_tables,
     config, memory, report, *, options, host_io, decode_inputs, reference=None, teacher_forced=False,
     audit=None, save_logits=None, label="greedy", profile=False, profile_dir=None,
+    on_token=None, cancelled=None, collect_routing=True,
 ):
     """Submit prompt chunks followed by one Decode call per subsequent token."""
     if teacher_forced and reference is None:
@@ -135,6 +136,8 @@ def run_request(
         engram.hash_ids([], 0, request_id=idle_rank)
     with ThreadPoolExecutor(max_workers=8) as uploads:
         for call in range(chunks + options.max_new_tokens - 1):
+            if cancelled is not None and cancelled():
+                raise CancelledError()
             step = call - chunks + 1
             index = int(step > 0)
             capacity = options.decode_capacity if index else options.capacity
@@ -218,6 +221,8 @@ def run_request(
             print("A3_ENGINE_END", json.dumps(marker), flush=True)
             committed += len(current_ids)
             report["decode_calls" if index else "prefill_calls"] += 1
+            if cancelled is not None and cancelled():
+                raise CancelledError()
             if step < 0:
                 continue
             logits = logit_buffer[step]
@@ -235,6 +240,8 @@ def run_request(
             token_times.append(time.monotonic())
             report["output_sequences"] = [{"request_id": request["request_id"], "token_ids": generated.copy()}]
             print("A3_TOKEN", json.dumps(dict(label=label, step=step + 1, token_id=token, committed=committed)), flush=True)
+            if on_token is not None:
+                on_token(token)
             if audit is not None:
                 report["cache_checks"].append(audit(runtime, ranks, host_cache, owner, step))
             if token == eos_id and not options.ignore_eos and request.get("trace_token_ids") is None:
@@ -250,7 +257,10 @@ def run_request(
                   end_to_end_seconds=token_times[-1] - start,
                   token_intervals_seconds=[b - a for a, b in zip(token_times, token_times[1:])],
                   engine_seconds=engine_times, text=tokenizer.decode(generated, skip_special_tokens=False))
-    report["prefill_routing"] = route_distribution(runtime, ranks, owner, len(prompt) - (chunks - 1) * options.chunk_size)
+    if collect_routing:
+        report["prefill_routing"] = route_distribution(
+            runtime, ranks, owner, len(prompt) - (chunks - 1) * options.chunk_size,
+        )
     if reference is not None:
         report["numerical_acceptance"] = reference["policy"]
         for step, value in enumerate(observed_logits):

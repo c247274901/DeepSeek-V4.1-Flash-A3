@@ -16,6 +16,7 @@ import subprocess
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from contextvars import ContextVar
 from pathlib import Path
 
@@ -181,27 +182,40 @@ def read_request(args, tokenizer):
                         development_replay=development)
 
 
-def generate(args, devices, *, manifests):
-    """Reuse the same rank-local weight and cache handles across both compiled graphs."""
-    checkpoint = Checkpoint(args.checkpoint)
-    tokenizer = Tokenizer.from_file(str(checkpoint.root / "tokenizer.json"))
-    request, replay = read_request(args, tokenizer)
-    acceptance = (len(request["input_ids"]), args.capacity, args.chunk_size, args.max_new_tokens) == (8192, 8192, 8192, 8)
-    if (args.validate_layers or args.reference_dir or args.profile_all_steps) and not acceptance:
-        raise ValueError("Frozen layer/logit comparisons and eight-step timing reports use the 8192+8 replay")
-    if args.validate_layers and args.context_capacity != 8200:
-        raise ValueError("Frozen layer fixtures require history capacity 8200")
-    owner = request["dp_rank"] * 4
-    weights = ResidentWeights(checkpoint)
-    selected_layers = [int(value) for value in args.validate_layers.split(",")] if args.validation_only else None
-    engram = HostEngram(checkpoint, tokenizer)
-    reference = None
-    if args.reference_dir:
-        policy = json.loads((args.reference_dir / "policy.json").read_text())
-        if policy["checkpoint_identity"] != checkpoint.identity or policy["input_sha256"] != replay["sha256"]:
-            raise ValueError("reference checkpoint or exact input replay differs")
-    elif args.teacher_forced:
-        raise ValueError("teacher forcing requires a frozen eight-step reference")
+@dataclasses.dataclass
+class ResidentGraphs:
+    """Live program bindings shared by offline generation and HTTP requests."""
+
+    runtime: DistributedWorker
+    programs: list
+    arguments: list
+    names: list
+    ranks: list
+    weights: ResidentWeights
+    engram: HostEngram
+    host_cache: list
+    rope_tables: tuple
+    config: RunConfig
+    host_io: dict
+    decode_inputs: DecodeInputs
+
+    def reset(self):
+        reset_caches(self.runtime, self.ranks, self.host_cache)
+        self.engram.history.clear()
+
+    def replay(self, tokenizer, request, memory, report, **kwargs):
+        return run_request(
+            self.runtime, self.programs, self.arguments, self.names, self.ranks, self.weights, self.engram,
+            tokenizer, request, self.host_cache, self.rope_tables, self.config, memory, report,
+            host_io=self.host_io, decode_inputs=self.decode_inputs, **kwargs,
+        )
+
+
+@contextmanager
+def open_resident_graphs(args, devices, weights, engram, memory, report, *, selected_layers=None, load_start=None):
+    """Load weights and register the two forward programs for the lifetime of a worker."""
+    if load_start is None:
+        load_start = time.monotonic()
     config = RunConfig(arch=BackendType.Ascend910, execution_mode=ExecutionMode.ONBOARD,
                        distributed_config=DistributedConfig(device_ids=devices, num_sub_workers=0),
                        ring_heap=(4 * 1024**3, 4 * 1024**3, (4 if C.MOE_TOKENS >= 128 else 2) * 1024**3, 1024**3), ring_dep_pool=131072)
@@ -225,23 +239,9 @@ def generate(args, devices, *, manifests):
                "attn_hc_out": ((args.capacity, M.hc_mult, M.hidden_size), torch.float32),
                "pre_mix_out": ((args.capacity, M.hc_mult), torch.float32),
                "logits": ((16, M.vocab_size), torch.float32), "sampled_ids": ((16, 8), torch.int32)}
-    report = {"status": "running", "platform": "a2a3", "topology": manifests[0]["topology"],
-              "checkpoint_identity": checkpoint.identity, "weight_layout": C.WEIGHT_LAYOUT_VERSION,
-              "cache_layout": C.CACHE_LAYOUT_VERSION, "replay": replay, "request_id": request["request_id"],
-              "dp_rank": request["dp_rank"], "resident_weight_bytes_per_rank": weights.bytes_per_rank,
-              "history_capacity": args.context_capacity, "prefill_calls": 0, "decode_calls": 0,
-              "output_sequences": [], "numerical_acceptance": "pending independent W8A8 logits reference",
-              "artifacts": [str(args.runtime_dir), str(args.decode_runtime_dir)],
-              "teacher_forced": args.teacher_forced, "logit_checks": [], "cache_checks": [],
-              "instrumented_cache_audits": args.audit_caches}
-    report["initialized_weight_layers"] = selected_layers if selected_layers is not None else list(range(40))
+
     saved_threads = torch.get_num_threads()
-    memory = HbmSampler(devices)
-    memory.sample()
-    memory.thread.start()
-    load_start = time.monotonic()
     try:
-        print("A3_PREPARE_RESIDENT_GRAPHS", flush=True)
         torch.set_num_threads(4)
         prefill_template = prepare_resident_inputs(weights, [], args.capacity, max_seq_len=args.context_capacity,
                                                   engram=engram)
@@ -335,6 +335,59 @@ def generate(args, devices, *, manifests):
             report["initialization_seconds"] = time.monotonic() - load_start
             report["allocator_committed_bytes_per_rank"] = [runtime.committed_device_memory(rank)
                                                             for rank in range(16)]
+
+            host_io["prefill_dirty_groups"] = ()
+            yield ResidentGraphs(runtime, programs, arguments, names, ranks, weights, engram, host_cache,
+                                 rope_tables, config, host_io, decode_inputs)
+    finally:
+        torch.set_num_threads(saved_threads)
+
+
+def generate(args, devices, *, manifests):
+    """Reuse the same rank-local weight and cache handles across both compiled graphs."""
+    checkpoint = Checkpoint(args.checkpoint)
+    tokenizer = Tokenizer.from_file(str(checkpoint.root / "tokenizer.json"))
+    request, replay = read_request(args, tokenizer)
+    acceptance = (len(request["input_ids"]), args.capacity, args.chunk_size, args.max_new_tokens) == (8192, 8192, 8192, 8)
+    if (args.validate_layers or args.reference_dir or args.profile_all_steps) and not acceptance:
+        raise ValueError("Frozen layer/logit comparisons and eight-step timing reports use the 8192+8 replay")
+    if args.validate_layers and args.context_capacity != 8200:
+        raise ValueError("Frozen layer fixtures require history capacity 8200")
+    owner = request["dp_rank"] * 4
+    weights = ResidentWeights(checkpoint)
+    selected_layers = [int(value) for value in args.validate_layers.split(",")] if args.validation_only else None
+    engram = HostEngram(checkpoint, tokenizer)
+    reference = None
+    if args.reference_dir:
+        policy = json.loads((args.reference_dir / "policy.json").read_text())
+        if policy["checkpoint_identity"] != checkpoint.identity or policy["input_sha256"] != replay["sha256"]:
+            raise ValueError("reference checkpoint or exact input replay differs")
+    elif args.teacher_forced:
+        raise ValueError("teacher forcing requires a frozen eight-step reference")
+    report = {"status": "running", "platform": "a2a3", "topology": manifests[0]["topology"],
+              "checkpoint_identity": checkpoint.identity, "weight_layout": C.WEIGHT_LAYOUT_VERSION,
+              "cache_layout": C.CACHE_LAYOUT_VERSION, "replay": replay, "request_id": request["request_id"],
+              "dp_rank": request["dp_rank"], "resident_weight_bytes_per_rank": weights.bytes_per_rank,
+              "history_capacity": args.context_capacity, "prefill_calls": 0, "decode_calls": 0,
+              "output_sequences": [], "numerical_acceptance": "pending independent W8A8 logits reference",
+              "artifacts": [str(args.runtime_dir), str(args.decode_runtime_dir)],
+              "teacher_forced": args.teacher_forced, "logit_checks": [], "cache_checks": [],
+              "instrumented_cache_audits": args.audit_caches}
+    report["initialized_weight_layers"] = selected_layers if selected_layers is not None else list(range(40))
+    saved_threads = torch.get_num_threads()
+    memory = HbmSampler(devices)
+    memory.sample()
+    memory.thread.start()
+    load_start = time.monotonic()
+    try:
+        print("A3_PREPARE_RESIDENT_GRAPHS", flush=True)
+        with open_resident_graphs(
+            args, devices, weights, engram, memory, report, selected_layers=selected_layers, load_start=load_start,
+        ) as graphs:
+            runtime, programs = graphs.runtime, graphs.programs
+            arguments, names, ranks = graphs.arguments, graphs.names, graphs.ranks
+            host_cache, rope_tables, config = graphs.host_cache, graphs.rope_tables, graphs.config
+            host_io, decode_inputs = graphs.host_io, graphs.decode_inputs
             if args.validate_layers:
                 from .validation import LayerValidationError, validate_layers
 

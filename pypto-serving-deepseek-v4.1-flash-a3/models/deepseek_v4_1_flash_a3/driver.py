@@ -112,6 +112,19 @@ def load_manifest(directory, *, mode, capacity=None):
     return actual
 
 
+def compile_generation_graphs(prefill_dir, decode_dir, *, devices, context, prefill_capacity,
+                              prefill_slab_rows, decode_capacity=16):
+    """Compile each phase in its own process with the matching runtime ABI."""
+    for phase, directory in (("prefill", prefill_dir), ("decode", decode_dir)):
+        cmd = [sys.executable, str(Path(__file__).with_name(f"{phase}_fwd.py")), "--compile-only", "--prepare-windows",
+               "--output", str(directory), "--context-capacity", str(context), "--devices", devices]
+        if phase == "prefill":
+            cmd.extend(("--capacity", str(prefill_capacity), "--prefill-moe-slab-rows", str(prefill_slab_rows)))
+        else:
+            cmd.extend(("--decode-capacity", str(decode_capacity)))
+        subprocess.run(cmd, check=True)
+
+
 def main(function, *, mode, capacity, argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("-p", "--platform", choices=["a2a3"], default="a2a3")
@@ -225,16 +238,11 @@ def main(function, *, mode, capacity, argv=None):
         args.runtime_dir, args.decode_runtime_dir = args.output / "prefill", args.output / "decode"
         context = args.context_capacity or (16384 if app_request else HISTORY_CAPACITY)
         prefill_capacity = args.capacity or ((args.chunk_size + 15) // 16 * 16)
-        for phase, directory in (("prefill", args.runtime_dir), ("decode", args.decode_runtime_dir)):
-            cmd = [sys.executable, str(Path(__file__).with_name(f"{phase}_fwd.py")), "--compile-only", "--prepare-windows",
-                   "--output", str(directory), "--context-capacity", str(context), "--devices", args.devices]
-            if phase == "prefill":
-                cmd.extend(("--capacity", str(prefill_capacity), "--prefill-moe-slab-rows",
-                            str(args.prefill_moe_slab_rows or C.default_prefill_slab_rows(prefill_capacity))))
-            else:
-                cmd.extend(("--decode-capacity", str(args.decode_capacity or 16)))
-            # Each phase has its own compile-time shapes.
-            subprocess.run(cmd, check=True)
+        compile_generation_graphs(
+            args.runtime_dir, args.decode_runtime_dir, devices=args.devices, context=context,
+            prefill_capacity=prefill_capacity, decode_capacity=args.decode_capacity or 16,
+            prefill_slab_rows=args.prefill_moe_slab_rows or C.default_prefill_slab_rows(prefill_capacity),
+        )
     manifests = (load_manifest(args.runtime_dir, mode="prefill"),
                  load_manifest(args.decode_runtime_dir, mode="decode", capacity=args.decode_capacity))
     if args.capacity is not None and function is None and args.capacity != manifests[0]["capacity"]:
