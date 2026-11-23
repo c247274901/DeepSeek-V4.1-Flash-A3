@@ -14,7 +14,17 @@ Install the service's Python dependencies in the same environment.
 
 ```bash
 python -m pip install -r pypto-serving-deepseek-v4.1-flash-a3/requirements.txt
+python -c 'import pypto.language; print(pypto.language.__file__)'
 ```
+
+If the CANN environment also provides a Python package named PyPTO, put the
+pinned PyPTO installation first on `PYTHONPATH` after sourcing CANN.
+
+Use a CANN installation with A3 HCCL support. If communicator initialization
+returns `HCCL_E_RUNTIME` (15), check the Ascend debug log. A missing
+`lib64/hccl_aiv_op_ascend910B.o` prevented startup on one CANN 9.1 installation.
+The existing CANN 9.0 installation passed a two-device AllReduce check with
+the pinned PyPTO environment.
 
 Pass the external DeepSeek-V4.1-Flash W8A8 checkpoint and a sixteen-device
 allocation. The service uses the checkpoint tokenizer and text renderer.
@@ -48,13 +58,13 @@ curl -N http://127.0.0.1:8000/v1/chat/completions \
 support greedy generation, EOS stopping, `ignore_eos` and optional returned
 token IDs. `/metrics` reports queue counts and runtime configuration. The
 native graphs support one active request and a context of up to 16384
-positions including output, with chunk size up to 8192. The server queues up to eight
-waiting requests by default and clears the request's KV and Engram history
+positions including output, with chunk size up to 8192. The server queues
+up to eight waiting requests by default and clears the KV and Engram history
 before reusing the slot. Continuous batching and speculation are outside
 this adapter's supported interface.
 
-For offline replay and compiled graph commands, see the
-[model runbook](pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/README.md).
+Run the [offline replay and compile commands](pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/README.md)
+from the `pypto-serving-deepseek-v4.1-flash-a3/` directory.
 
 ## History and validation
 
@@ -71,5 +81,11 @@ Blueprint and the Playground web report are in the [task catalog](docs/blueprint
 
 The 8192-row Prefill graph (MoE slab 128) and the 16-row Decode graph
 compiled for A3 at context capacity 8200. Host tests cover the serving routes
-and native Decode staging. Numerical acceptance and
-serving latency on sixteen devices require the checkpoint and a free allocation.
+and native Decode staging.
+
+On sixteen A3 devices with CANN 9.0, the service loaded the W8A8 checkpoint,
+initialized both communication windows, and reported ready on `/health`.
+Two requests to `/v1/completions` each generated three tokens from a
+three-token prompt. The ordinary and streamed responses returned the same
+token IDs across reuse of the request slot. Dataset accuracy and serving
+latency require separate measurements.
