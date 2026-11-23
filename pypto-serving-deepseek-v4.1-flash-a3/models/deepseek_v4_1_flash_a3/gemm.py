@@ -17,7 +17,7 @@ if not __package__:
 
 import torch
 import pypto.language as pl
-from .activation_quant import quantize_activation
+from .activation_quant import quantize_activation, quantize_projection_activation
 from .quant import decode_fp8, decode_scale
 
 
@@ -131,8 +131,60 @@ def mx_mm(
     return mx_mm_acc(acc, a, sa, b, sb, m, k, n)
 
 
+def make_gemm_int8_tiled(*, k_stages, pipe_slots):
+    @pl.jit.inline(auto_scope=False)
+    def gemm_int8_tiled(
+        payload: pl.Tensor,
+        activation_scale: pl.Tensor,
+        weight: pl.Tensor,
+        weight_scale: pl.Tensor,
+        output: pl.Tensor,
+        num_tokens: pl.Scalar[pl.INT32],
+        width: pl.constexpr,
+        output_width: pl.constexpr,
+        name_hint: pl.constexpr,
+        n_tile: pl.constexpr,
+        k_tile: pl.constexpr,
+        output_major: pl.constexpr,
+        row_tile: pl.constexpr,
+    ):
+        """Apply per-token and per-channel scales to an INT8 Cube product."""
+        blocks = (num_tokens + row_tile - 1) // row_tile * (output_width // n_tile)
+        workers = pl.max(1, pl.min(blocks, pl.system.available_cluster_count()))
+        for worker in pl.spmd(workers, name_hint=name_hint, optimizations=[pl.cross_core_slot(slot_num=pipe_slots)]):
+            for block in pl.range(worker, blocks, workers):
+                row = block // (output_width // n_tile) * row_tile
+                col = block % (output_width // n_tile) * n_tile
+                valid_rows = pl.max(0, pl.min(row_tile, num_tokens - row))
+                seed = pl.tile.create([row_tile, n_tile], dtype=pl.INT32, target_memory=pl.MemorySpace.Acc, compact=True)
+                acc = pl.set_validshape(seed, valid_rows, n_tile)
+                for k0 in pl.pipeline(0, width, k_tile, stage=k_stages):
+                    a = pl.load(payload, [row, k0], [row_tile, k_tile], valid_shape=[valid_rows, k_tile])
+                    if output_major:
+                        natural = pl.load(weight, [col, k0], [n_tile, k_tile], target_memory=pl.MemorySpace.Mat)
+                        transposed = pl.tile.transpose_view(natural)
+                        acc = pl.matmul_acc(acc, a, transposed, init_cond=(k0 == 0))
+                    else:
+                        b = pl.load(weight, [k0, col], [k_tile, n_tile])
+                        acc = pl.matmul_acc(acc, a, b, init_cond=(k0 == 0))
+                value = pl.cast(acc, pl.FP32)
+                a_scale = pl.load(activation_scale, [row, 0], [row_tile, 1], valid_shape=[valid_rows, 1])
+                b_scale = pl.load(weight_scale, [0, col], [1, n_tile])
+                scaled = pl.row_expand_mul(value, a_scale)
+                scaled = pl.col_expand_mul(scaled, b_scale)
+                rounded = pl.cast(scaled, pl.BF16, mode="rint")
+                output = pl.store(pl.set_validshape(rounded, valid_rows, n_tile), [row, col], output)
+        return output
+
+    return gemm_int8_tiled
+
+
+gemm_int8_tiled = make_gemm_int8_tiled(k_stages=1, pipe_slots=2)
+prefill_gemm_int8_tiled = make_gemm_int8_tiled(k_stages=2, pipe_slots=1)
+
+
 @pl.jit.inline(auto_scope=False)
-def gemm_int8_tiled(
+def gemm_int8_pair_columns(
     payload: pl.Tensor,
     activation_scale: pl.Tensor,
     weight: pl.Tensor,
@@ -146,33 +198,149 @@ def gemm_int8_tiled(
     k_tile: pl.constexpr,
     output_major: pl.constexpr,
     row_tile: pl.constexpr,
+    rope_cos: pl.Tensor,
+    rope_sin: pl.Tensor,
+    fuse_rope: pl.constexpr,
+    rope_dim: pl.constexpr,
+    rope_offset: pl.constexpr,
 ):
-    """Apply per-token and per-channel scales to an INT8 Cube product."""
-    blocks = (num_tokens + row_tile - 1) // row_tile * (output_width // n_tile)
+    """Compute two adjacent output panels while reusing each activation tile.
+
+    Decode Q-A and Q-B use an even number of output panels. The paired
+    schedule keeps one activation tile live while it feeds two Cube products,
+    reducing repeated activation loads and the number of SPMD blocks. The
+    weight ABI remains the canonical [K, N] layout used by the existing
+    projections. Q-B can optionally apply RoPE to its second output panel
+    before the result is stored.
+    """
+    panels = output_width // n_tile
+    pairs = panels // 2
+    blocks = (num_tokens + row_tile - 1) // row_tile * pairs
     workers = pl.max(1, pl.min(blocks, pl.system.available_cluster_count()))
     for worker in pl.spmd(workers, name_hint=name_hint):
         for block in pl.range(worker, blocks, workers):
-            row = block // (output_width // n_tile) * row_tile
-            col = block % (output_width // n_tile) * n_tile
+            row = block // pairs * row_tile
+            first_panel = block % pairs * 2
+            first_col = first_panel * n_tile
+            second_col = first_col + n_tile
             valid_rows = pl.max(0, pl.min(row_tile, num_tokens - row))
-            seed = pl.tile.create([row_tile, n_tile], dtype=pl.INT32, target_memory=pl.MemorySpace.Acc, compact=True)
-            acc = pl.set_validshape(seed, valid_rows, n_tile)
+            first_seed = pl.tile.create(
+                [row_tile, n_tile], dtype=pl.INT32,
+                target_memory=pl.MemorySpace.Acc, compact=True,
+            )
+            second_seed = pl.tile.create(
+                [row_tile, n_tile], dtype=pl.INT32,
+                target_memory=pl.MemorySpace.Acc, compact=True,
+            )
+            first_acc = pl.set_validshape(first_seed, valid_rows, n_tile)
+            second_acc = pl.set_validshape(second_seed, valid_rows, n_tile)
             for k0 in pl.range(0, width, k_tile):
-                a = pl.load(payload, [row, k0], [row_tile, k_tile], valid_shape=[valid_rows, k_tile])
+                source = pl.load(
+                    payload, [row, k0], [row_tile, k_tile],
+                    valid_shape=[valid_rows, k_tile],
+                )
                 if output_major:
-                    natural = pl.load(weight, [col, k0], [n_tile, k_tile], target_memory=pl.MemorySpace.Mat)
-                    transposed = pl.tile.transpose_view(natural)
-                    acc = pl.matmul_acc(acc, a, transposed, init_cond=(k0 == 0))
+                    first_nk = pl.load(
+                        weight, [first_col, k0], [n_tile, k_tile],
+                        target_memory=pl.MemorySpace.Mat,
+                    )
+                    second_nk = pl.load(
+                        weight, [second_col, k0], [n_tile, k_tile],
+                        target_memory=pl.MemorySpace.Mat,
+                    )
+                    first_weight_mat = pl.tile.transpose_view(first_nk)
+                    second_weight_mat = pl.tile.transpose_view(second_nk)
+                    first_acc = pl.matmul_acc(
+                        first_acc, source, first_weight_mat, init_cond=(k0 == 0),
+                    )
+                    second_acc = pl.matmul_acc(
+                        second_acc, source, second_weight_mat, init_cond=(k0 == 0),
+                    )
                 else:
-                    b = pl.load(weight, [k0, col], [k_tile, n_tile])
-                    acc = pl.matmul_acc(acc, a, b, init_cond=(k0 == 0))
-            value = pl.cast(acc, pl.FP32)
-            a_scale = pl.load(activation_scale, [row, 0], [row_tile, 1], valid_shape=[valid_rows, 1])
-            b_scale = pl.load(weight_scale, [0, col], [1, n_tile])
-            scaled = pl.row_expand_mul(value, a_scale)
-            scaled = pl.col_expand_mul(scaled, b_scale)
-            rounded = pl.cast(scaled, pl.BF16, mode="rint")
-            output = pl.store(pl.set_validshape(rounded, valid_rows, n_tile), [row, col], output)
+                    first_weight_vec = pl.load(weight, [k0, first_col], [k_tile, n_tile])
+                    second_weight_vec = pl.load(weight, [k0, second_col], [k_tile, n_tile])
+                    first_acc = pl.matmul_acc(
+                        first_acc, source, first_weight_vec, init_cond=(k0 == 0),
+                    )
+                    second_acc = pl.matmul_acc(
+                        second_acc, source, second_weight_vec, init_cond=(k0 == 0),
+                    )
+
+            a_scale = pl.load(
+                activation_scale, [row, 0], [row_tile, 1],
+                valid_shape=[valid_rows, 1],
+            )
+            first_scale = pl.load(weight_scale, [0, first_col], [1, n_tile])
+            second_scale = pl.load(weight_scale, [0, second_col], [1, n_tile])
+
+            first_value = pl.row_expand_mul(pl.cast(first_acc, pl.FP32), a_scale)
+            first_value = pl.col_expand_mul(first_value, first_scale)
+            first_value = pl.cast(first_value, pl.BF16, mode="rint")
+            output = pl.store(
+                pl.set_validshape(first_value, valid_rows, n_tile),
+                [row, first_col], output,
+            )
+
+            second_value = pl.row_expand_mul(pl.cast(second_acc, pl.FP32), a_scale)
+            second_value = pl.col_expand_mul(second_value, second_scale)
+            second_value = pl.cast(second_value, pl.BF16, mode="rint")
+            if fuse_rope:
+                rope_value = pl.set_validshape(second_value, row_tile, n_tile)
+                tail_bf16 = pl.tile.slice(
+                    rope_value, [row_tile, rope_dim], [0, rope_offset],
+                )
+                tail = pl.cast(tail_bf16, pl.FP32)
+                even = pl.tile.gather_mask(tail, mask_pattern=pl.tile.MaskPattern.P0101)
+                odd = pl.tile.gather_mask(tail, mask_pattern=pl.tile.MaskPattern.P1010)
+                cosine = pl.load(
+                    rope_cos, [row, 0], [row_tile, rope_dim // 2],
+                    valid_shape=[valid_rows, rope_dim // 2],
+                )
+                sine = pl.load(
+                    rope_sin, [row, 0], [row_tile, rope_dim // 2],
+                    valid_shape=[valid_rows, rope_dim // 2],
+                )
+                cosine = pl.set_validshape(
+                    pl.fillpad(cosine, pad_value=pl.PadValue.zero),
+                    row_tile, rope_dim // 2,
+                )
+                sine = pl.set_validshape(
+                    pl.fillpad(sine, pad_value=pl.PadValue.zero),
+                    row_tile, rope_dim // 2,
+                )
+                real = pl.sub(pl.mul(even, cosine), pl.mul(odd, sine))
+                imag = pl.add(pl.mul(even, sine), pl.mul(odd, cosine))
+                real_lanes = pl.tile.full([row_tile, rope_dim], dtype=pl.FP32, value=0.0)
+                real_lanes = pl.tile.scatter_mask(
+                    real_lanes, real, mask_pattern=pl.tile.MaskPattern.P0101,
+                )
+                imag_lanes = pl.tile.full([row_tile, rope_dim], dtype=pl.FP32, value=0.0)
+                imag_lanes = pl.tile.scatter_mask(
+                    imag_lanes, imag, mask_pattern=pl.tile.MaskPattern.P1010,
+                )
+                real_bits = pl.reinterpret_view(real_lanes, pl.INT16)
+                imag_bits = pl.reinterpret_view(imag_lanes, pl.INT16)
+                rotated = pl.reinterpret_view(pl.or_(real_bits, imag_bits), pl.FP32)
+                rotated = pl.cast(rotated, pl.BF16, mode="rint")
+                prefix = pl.tile.slice(
+                    rope_value, [row_tile, rope_offset], [0, 0],
+                    valid_shape=[valid_rows, rope_offset],
+                )
+                rotated = pl.tile.slice(
+                    rotated, [row_tile, rope_dim], [0, 0],
+                    valid_shape=[valid_rows, rope_dim],
+                )
+                output = pl.store(
+                    prefix, [row, second_col], output,
+                )
+                output = pl.store(
+                    rotated, [row, second_col + rope_offset], output,
+                )
+            else:
+                output = pl.store(
+                    pl.set_validshape(second_value, valid_rows, n_tile),
+                    [row, second_col], output,
+                )
     return output
 
 
@@ -279,9 +447,10 @@ def gemm_dynamic_int8(
     output_width: pl.constexpr,
     name_hint: pl.constexpr,
     output_major: pl.constexpr,
+    prefill: pl.constexpr,
 ):
     """Quantize BF16 token rows and project an INT8 weight matrix."""
-    payload, scale = quantize_activation(source, num_tokens, width)
+    payload, scale = quantize_projection_activation(source, num_tokens, width, True, prefill)
     return gemm_int8(payload, scale, weight, weight_scale, output, num_tokens, width, output_width, name_hint, 128, 256, output_major)
 
 
@@ -301,55 +470,72 @@ def golden_dynamic_int8(source, weight, scale):
     return (product.float() * activation_scale * scale.float().reshape(1, -1)).bfloat16()
 
 
-@pl.jit.inline(auto_scope=False)
-def gemm_bf16_to_bf16(
-    source: pl.Tensor,
-    weight: pl.Tensor,
-    output: pl.Tensor,
-    num_tokens: pl.Scalar[pl.INT32],
-    ready: pl.Scalar[pl.TASK_ID],
-    width: pl.constexpr,
-    output_width: pl.constexpr,
-    n_tile: pl.constexpr,
-    k_tile: pl.constexpr,
-    workers: pl.constexpr,
-    name_hint: pl.constexpr,
-    source_col: pl.Scalar[pl.INT32],
-    output_col: pl.Scalar[pl.INT32],
-    ordered: pl.constexpr,
-    row_tile: pl.constexpr,
-):
-    """Project BF16 ND buffers with explicit FP32 accumulation and column offsets."""
-    blocks = (num_tokens + row_tile - 1) // row_tile * (output_width // n_tile)
-    task_workers = pl.max(pl.min(blocks, workers), 1)
-    entry_deps = pl.array.create(1, pl.TASK_ID)
-    entry_deps[0] = ready
-    with pl.spmd(task_workers, name_hint=name_hint, deps=[entry_deps[0]]) as projection_tid:
-        worker = pl.tile.get_block_idx()
-        for block in pl.range(worker, blocks, task_workers):
-            row = block // (output_width // n_tile) * row_tile
-            col = block % (output_width // n_tile) * n_tile
-            rows = pl.max(0, pl.min(row_tile, num_tokens - row))
-            if ordered:
-                ordered_acc = pl.tile.full([row_tile, n_tile], dtype=pl.FP32, value=0.0)
-                for k in pl.range(0, width, k_tile):
-                    ordered_a = pl.load(source, [row, source_col + k], [row_tile, k_tile], valid_shape=[rows, k_tile])
-                    ordered_a = pl.set_validshape(ordered_a, row_tile, k_tile)
-                    ordered_w = pl.load(weight, [k, col], [k_tile, n_tile])
-                    ordered_acc = bf16_ordered_accumulate(ordered_acc, ordered_a, ordered_w, row_tile, n_tile, k_tile)
-                rounded = pl.cast(ordered_acc, pl.BF16, mode="rint")
-                ordered_value = pl.set_validshape(rounded, rows, n_tile)
-                output = pl.store(ordered_value, [row, output_col + col], output)
-            else:
-                cube_seed = pl.tile.create([row_tile, n_tile], dtype=pl.FP32, target_memory=pl.MemorySpace.Acc, compact=True)
-                cube_acc = pl.set_validshape(cube_seed, rows, n_tile)
-                for k in pl.range(0, width, k_tile):
-                    cube_a = pl.load(source, [row, source_col + k], [row_tile, k_tile], valid_shape=[rows, k_tile])
-                    cube_w = pl.load(weight, [k, col], [k_tile, n_tile], target_memory=pl.MemorySpace.Mat)
-                    cube_acc = pl.matmul_acc(cube_acc, cube_a, cube_w, init_cond=(k == 0))
-                cube_value = pl.set_validshape(cube_acc, rows, n_tile)
-                output = pl.store(cube_value, [row, output_col + col], output)
-    return output, projection_tid
+def make_gemm_bf16_to_bf16(*, columns_first):
+    @pl.jit.inline(auto_scope=False)
+    def gemm_bf16_to_bf16(
+        source: pl.Tensor,
+        weight: pl.Tensor,
+        output: pl.Tensor,
+        num_tokens: pl.Scalar[pl.INT32],
+        ready: pl.Scalar[pl.TASK_ID],
+        width: pl.constexpr,
+        output_width: pl.constexpr,
+        n_tile: pl.constexpr,
+        k_tile: pl.constexpr,
+        workers: pl.constexpr,
+        name_hint: pl.constexpr,
+        source_col: pl.Scalar[pl.INT32],
+        output_col: pl.Scalar[pl.INT32],
+        ordered: pl.constexpr,
+        row_tile: pl.constexpr,
+        stages: pl.constexpr,
+    ):
+        """Project BF16 ND buffers with explicit FP32 accumulation and column offsets."""
+        col_blocks = output_width // n_tile
+        if columns_first:
+            row_blocks = (num_tokens + row_tile - 1) // row_tile
+            blocks = row_blocks * col_blocks
+        else:
+            blocks = (num_tokens + row_tile - 1) // row_tile * col_blocks
+        task_workers = pl.max(pl.min(blocks, workers), 1)
+        entry_deps = pl.array.create(1, pl.TASK_ID)
+        entry_deps[0] = ready
+        with pl.spmd(task_workers, name_hint=name_hint, deps=[entry_deps[0]]) as projection_tid:
+            worker = pl.tile.get_block_idx()
+            for block in pl.range(worker, blocks, task_workers):
+                if columns_first:
+                    row = block % row_blocks * row_tile
+                    col = block // row_blocks * n_tile
+                else:
+                    row = block // col_blocks * row_tile
+                    col = block % col_blocks * n_tile
+                rows = pl.max(0, pl.min(row_tile, num_tokens - row))
+                if ordered:
+                    ordered_acc = pl.tile.full([row_tile, n_tile], dtype=pl.FP32, value=0.0)
+                    for k in pl.range(0, width, k_tile):
+                        ordered_a = pl.load(source, [row, source_col + k], [row_tile, k_tile], valid_shape=[rows, k_tile])
+                        ordered_a = pl.set_validshape(ordered_a, row_tile, k_tile)
+                        ordered_w = pl.load(weight, [k, col], [k_tile, n_tile])
+                        ordered_acc = bf16_ordered_accumulate(ordered_acc, ordered_a, ordered_w, row_tile, n_tile, k_tile)
+                    rounded = pl.cast(ordered_acc, pl.BF16, mode="rint")
+                    ordered_value = pl.set_validshape(rounded, rows, n_tile)
+                    output = pl.store(ordered_value, [row, output_col + col], output)
+                else:
+                    cube_seed = pl.tile.create([row_tile, n_tile], dtype=pl.FP32, target_memory=pl.MemorySpace.Acc, compact=True)
+                    cube_acc = pl.set_validshape(cube_seed, rows, n_tile)
+                    for k in pl.pipeline(0, width, k_tile, stage=stages):
+                        cube_a = pl.load(source, [row, source_col + k], [row_tile, k_tile], valid_shape=[rows, k_tile])
+                        cube_w = pl.load(weight, [k, col], [k_tile, n_tile], target_memory=pl.MemorySpace.Mat)
+                        cube_acc = pl.matmul_acc(cube_acc, cube_a, cube_w, init_cond=(k == 0))
+                    cube_value = pl.set_validshape(cube_acc, rows, n_tile)
+                    output = pl.store(cube_value, [row, output_col + col], output)
+        return output, projection_tid
+
+    return gemm_bf16_to_bf16
+
+
+gemm_bf16_to_bf16 = make_gemm_bf16_to_bf16(columns_first=False)
+gemm_bf16_to_bf16_columns_first = make_gemm_bf16_to_bf16(columns_first=True)
 
 
 def make_projection_validation(width):

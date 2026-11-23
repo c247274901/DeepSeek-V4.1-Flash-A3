@@ -62,7 +62,7 @@ def expert_routed_compute(
         source, source_scale, w1, scale1, w3, scale3, route_weights, hidden, count,
         D, MOE_INTER, EXPERT_N_TILE, EXPERT_K_TILE, SWIGLU_LIMIT, True, "routed_swiglu", output_major,
     )
-    return gemm_dynamic_int8(hidden, w2, scale2, output, count, MOE_INTER, D, "routed_down", output_major)
+    return gemm_dynamic_int8(hidden, w2, scale2, output, count, MOE_INTER, D, "routed_down", output_major, prefill=False)
 
 
 @pl.jit.inline(auto_scope=False)

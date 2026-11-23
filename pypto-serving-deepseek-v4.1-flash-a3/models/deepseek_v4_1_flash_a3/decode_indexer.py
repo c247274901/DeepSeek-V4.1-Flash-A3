@@ -1436,7 +1436,7 @@ def project_index_weights(
     result, completed = gemm_bf16_to_bf16(
         source, weight, output, num_tokens, ready,
         width=D, output_width=INDEX_H, n_tile=INDEX_H, k_tile=INDEX_PROJ_K_TILE,
-        workers=8, name_hint="proj_idx_w", source_col=0, output_col=0, ordered=False, row_tile=16,
+        workers=8, name_hint="proj_idx_w", source_col=0, output_col=0, ordered=False, row_tile=16, stages=1,
     )
     return completed
 
@@ -1490,7 +1490,7 @@ def c2a_project_index_key(
     result, completed = gemm_bf16_to_bf16(
         source, weight, output, num_tokens, ready,
         width=HEAD_DIM, output_width=INDEX_DIM, n_tile=INDEX_PROJ_N_TILE, k_tile=INDEX_PROJ_K_TILE,
-        workers=32, name_hint='proj_idx_k', source_col=0, output_col=0, ordered=False, row_tile=16,
+        workers=32, name_hint='proj_idx_k', source_col=0, output_col=0, ordered=False, row_tile=16, stages=1,
     )
     return completed
 
@@ -2053,7 +2053,7 @@ def c1a_project_index_key(
     result, completed = gemm_bf16_to_bf16(
         source, weight, output, num_tokens, ready,
         width=HEAD_DIM, output_width=INDEX_DIM, n_tile=INDEX_PROJ_N_TILE, k_tile=INDEX_PROJ_K_TILE,
-        workers=8, name_hint='proj_idx_k', source_col=0, output_col=0, ordered=False, row_tile=16,
+        workers=8, name_hint='proj_idx_k', source_col=0, output_col=0, ordered=False, row_tile=16, stages=1,
     )
     return completed
 
@@ -2114,7 +2114,7 @@ def l2_decode_indexer_validation(
     projected = pl.create_tensor([pl.tensor.dim(x, 0), INDEX_QUERY_WIDTH], dtype=pl.BF16)
     gemm_dynamic_int8(
         latent, query_weight, query_weight_scale, projected, num_tokens,
-        Q_LORA, INDEX_QUERY_WIDTH, "proj_idx_q", False,
+        Q_LORA, INDEX_QUERY_WIDTH, "proj_idx_q", False, prefill=False,
     )
     query_tid = quantize_index_query(projected, cos, sin, query, query_scale, num_tokens, entry)
     weights_tid = project_index_weights(x, weight_projection, weights, num_tokens, entry)
