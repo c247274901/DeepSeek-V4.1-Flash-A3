@@ -220,6 +220,50 @@ def prefill_attention(
 
 
 @pl.jit.inline(auto_scope=False)
+def _pack_moe_round_inputs(
+    x_hc: pl.Tensor,
+    pre_mix: pl.Tensor,
+    round_hidden: pl.Tensor,
+    round_pre: pl.Tensor,
+    begin: pl.Scalar[pl.INDEX],
+    rows: pl.Scalar[pl.INDEX],
+    active: pl.Scalar[pl.INDEX],
+    reuse_ready: pl.Scalar[pl.TASK_ID],
+):
+    """Materialize a zero-padded input slab."""
+    capacity = pl.tensor.dim(x_hc, 0)
+    source_hidden = pl.reshape(x_hc, [capacity, HC_DIM])
+    source_pre = pl.reshape(pre_mix, [1, capacity * HC_MULT])
+    packed = pl.reshape(round_hidden, [rows, HC_DIM])
+    packed_pre = pl.reshape(round_pre, [1, rows * HC_MULT])
+    with pl.spmd(48, name_hint="moe_round_pack", deps=[reuse_ready]) as packed_ready:
+        worker = pl.tile.get_block_idx()
+        for block in pl.range(worker, rows // 4 * (HC_DIM // 1024), 48):
+            row = block // (HC_DIM // 1024) * 4
+            column = block % (HC_DIM // 1024) * 1024
+            live = pl.max(0, pl.min(4, active - row))
+            if live > 0:
+                source = pl.load(source_hidden, [begin + row, column], [4, 1024], valid_shape=[live, 1024])
+                values = pl.fillpad(source, pad_value=pl.PadValue.zero)
+                pl.store(pl.set_validshape(values, 4, 1024), [row, column], packed)
+            else:
+                empty = pl.tile.full([4, 1024], dtype=pl.FP32, value=0.0)
+                pl.store(empty, [row, column], packed)
+        for tile in pl.range(worker, rows // 16, 48):
+            offset = tile * 16
+            live_pre = pl.max(0, pl.min(16, active - offset)) * HC_MULT
+            if live_pre > 0:
+                start = (begin + offset) * HC_MULT
+                factors = pl.load(source_pre, [0, start], [1, 16 * HC_MULT], valid_shape=[1, live_pre])
+                complete_pre = pl.fillpad(factors, pad_value=pl.PadValue.zero)
+                pl.store(pl.set_validshape(complete_pre, 1, 16 * HC_MULT), [0, offset * HC_MULT], packed_pre)
+            else:
+                empty = pl.tile.full([1, 16 * HC_MULT], dtype=pl.FP32, value=0.0)
+                pl.store(empty, [0, offset * HC_MULT], packed_pre)
+    return packed_ready
+
+
+@pl.jit.inline(auto_scope=False)
 def _prefill_moe(
     x_hc: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
     pre_mix: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
@@ -291,8 +335,6 @@ def _prefill_moe(
 ):
     """Execute one interleaved TP slab per EP round."""
     capacity = pl.tensor.dim(x_hc, 0)
-    source_hidden = pl.reshape(x_hc, [capacity, HC_DIM])
-    source_pre = pl.reshape(pre_mix, [1, capacity * HC_MULT])
     output_flat = pl.reshape(x_next, [capacity, HC_DIM])
     round_tokens = MOE_TOKENS * TP_SIZE
     rounds = (CAPACITY + round_tokens - 1) // round_tokens
@@ -306,36 +348,19 @@ def _prefill_moe(
             rows = physical_rows
             if active == 0:
                 rows = pl.min(physical_rows, 16)
-            round_hidden = pl.slice(slab_hidden, [rows, HC_MULT, D], [0, 0, 0])
+            round_ready = completion[0]
+            if active == round_tokens and rows == round_tokens:
+                hidden_view = pl.slice(x_hc, [round_tokens, HC_MULT, D], [begin, 0, 0])
+                pre_view = pl.slice(pre_mix, [round_tokens, HC_MULT], [begin, 0])
+                round_hidden = pl.slice(hidden_view, [rows, HC_MULT, D], [0, 0, 0])
+                round_pre = pl.slice(pre_view, [rows, HC_MULT], [0, 0])
+            else:
+                round_hidden = pl.slice(slab_hidden, [rows, HC_MULT, D], [0, 0, 0])
+                round_pre = pl.slice(slab_pre, [rows, HC_MULT], [0, 0])
+                _pack_moe_round_inputs(x_hc, pre_mix, round_hidden, round_pre, begin, rows, active, round_ready)
             round_output = pl.slice(x_next, [rows, HC_MULT, D], [begin, 0, 0])
-            round_pre = pl.slice(slab_pre, [rows, HC_MULT], [0, 0])
             round_next = pl.slice(next_pre_mix, [rows, HC_MULT], [begin, 0])
             round_mixed = pl.slice(slab_mixed, [rows, D], [0, 0])
-            packed = pl.reshape(round_hidden, [rows, HC_DIM])
-            packed_pre = pl.reshape(round_pre, [1, rows * HC_MULT])
-            with pl.spmd(48, name_hint="moe_round_pack", deps=[completion[0]]):
-                worker = pl.tile.get_block_idx()
-                for block in pl.range(worker, rows // 4 * (HC_DIM // 1024), 48):
-                    row = block // (HC_DIM // 1024) * 4
-                    column = block % (HC_DIM // 1024) * 1024
-                    live = pl.max(0, pl.min(4, active - row))
-                    if live > 0:
-                        source = pl.load(source_hidden, [begin + row, column], [4, 1024], valid_shape=[live, 1024])
-                        values = pl.fillpad(source, pad_value=pl.PadValue.zero)
-                        pl.store(pl.set_validshape(values, 4, 1024), [row, column], packed)
-                    else:
-                        empty = pl.tile.full([4, 1024], dtype=pl.FP32, value=0.0)
-                        pl.store(empty, [row, column], packed)
-                for tile in pl.range(worker, rows // 16, 48):
-                    offset = tile * 16
-                    live_pre = pl.max(0, pl.min(16, active - offset)) * HC_MULT
-                    if live_pre > 0:
-                        factors = pl.load(source_pre, [0, (begin + offset) * HC_MULT], [1, 16 * HC_MULT], valid_shape=[1, live_pre])
-                        complete_pre = pl.fillpad(factors, pad_value=pl.PadValue.zero)
-                        pl.store(pl.set_validshape(complete_pre, 1, 16 * HC_MULT), [0, offset * HC_MULT], packed_pre)
-                    else:
-                        empty = pl.tile.full([1, 16 * HC_MULT], dtype=pl.FP32, value=0.0)
-                        pl.store(empty, [0, offset * HC_MULT], packed_pre)
             post = pl.create_tensor([rows, HC_MULT], dtype=pl.FP32)
             residual = pl.create_tensor([rows, HC_MULT, HC_MULT], dtype=pl.FP32)
             ffn_input = pl.create_tensor([rows, D], dtype=pl.BF16)
@@ -353,7 +378,7 @@ def _prefill_moe(
                 recv_meta, recv_x, recv_weights, arrived, data_arrived,
                 routed_output, combine_arrived, ffn_input, owned, round_next, post, residual,
                 local_gate_inputs, local_gate_indices, local_gate_weights,
-                active, ep_rank, ep_rank % TP_SIZE, epoch, prefill=True,
+                active, ep_rank, ep_rank % TP_SIZE, epoch, completion, True,
             )
             with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_moe_counts"):
                 for counter in pl.range(3):
@@ -361,7 +386,8 @@ def _prefill_moe(
                     pl.write(statistics, [round_id, counter], value)
             prefill_ffn_restore(
                 round_hidden, owned, post, residual, ffn_window, ffn_arrived,
-                round_mixed, round_output, ep_rank // TP_SIZE * TP_SIZE, ep_rank % TP_SIZE, active, epoch, prefill=True,
+                round_mixed, round_output, ep_rank // TP_SIZE * TP_SIZE, ep_rank % TP_SIZE, active, epoch,
+                prefill=True,
             )
             with pl.at(level=pl.Level.CORE_GROUP, name_hint="moe_round_complete") as completed:
                 hidden_anchor = pl.read(round_output, [0, 0, 0])

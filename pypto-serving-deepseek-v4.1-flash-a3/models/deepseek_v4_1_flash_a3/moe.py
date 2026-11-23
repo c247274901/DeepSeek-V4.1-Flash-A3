@@ -17,13 +17,14 @@ from .config import FLASH as M
 from .config import EP_SIZE, TP_SIZE
 from .config import MOE_TOKENS, N_LOCAL_EXPERTS, ROUTE_T_DYN
 from .config import T_DYN
+from .gate import gate_from_fp32
 from .gate import gate_normalized as npu_gate
 from .expert_shared import expert_shared
 from .expert_routed import (
     expert_routed_scatter,
 )
 from .hc import hc_pre, hc_post
-from .rmsnorm import rms_norm_tiled
+from .rmsnorm import prefill_ffn_norm_quant, rms_norm_tiled
 from .o_proj import prefill_tp_output_all_reduce
 
 
@@ -55,6 +56,11 @@ SIGNAL_PAD = 128  # 512-byte padded monotonic counter lane
 
 # tiling
 RECV_TILE = 16
+# Local owner rows are interleaved across TP ranks.  Panel copies amortize the
+# wide hidden-vector transfer while keeping the temporary below the A3 vector
+# buffer limit.
+LOCAL_ROW_TILE = 8
+COMBINE_TOKEN_TILE = 2
 
 
 @pl.jit.inline(auto_scope=False)
@@ -98,13 +104,18 @@ def dispatch(
     num_tokens: pl.Scalar[pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
     moe_epoch: pl.Scalar[pl.INT32],
+    reuse_deps: pl.Array[1, pl.TASK_ID],
 ):
     x_norm_mx_raw = x_norm_mx
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="moe_reuse_wait") as _reuse_tid:
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="moe_reuse_wait", deps=[reuse_deps]) as _reuse_tid:
         _anchor = pl.read(indices, [0, 0])
     send_starts = pl.create_tensor([N_RANKS, N_LOCAL], dtype=pl.INT32)
     recv_starts = pl.create_tensor([N_RANKS, N_LOCAL], dtype=pl.INT32)
     route_slots = pl.create_tensor([T, ROUTE_WIDTH], dtype=pl.INT32)
+    # Stage routes in destination-major order so each peer can receive a
+    # contiguous hidden and metadata range.
+    send_aux = pl.create_tensor([ROUTED_RECV_ROWS, AUX_WIDTH], dtype=pl.FP32)
+    send_totals = pl.create_tensor([N_RANKS], dtype=pl.INT32)
     meta_stage = pl.create_tensor([N_RANKS, N_LOCAL], dtype=pl.INT32)
     # Publish per-source route counts.
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="dispatch_meta_publish", deps=[_reuse_tid], allow_early_resolve=True) as _meta_push_tid:
@@ -143,6 +154,7 @@ def dispatch(
                 dst=recv_meta, peer=dst, src=meta_stage,
                 dst_offsets=[my_rank, 0], src_offsets=[dst, 0], shape=[1, N_LOCAL],
             )
+            pl.write(send_totals, [dst], prefix)
             if dst != my_rank:
                 pld.system.notify(
                     target=arrived, peer=dst, offsets=[my_rank, 0],
@@ -174,33 +186,48 @@ def dispatch(
             pl.write(recv_count_out, [e, 1], expert_prefix)
             expert_prefix = expert_prefix + pl.cast((acc + 15) // 16 * 16, pl.INT32)
 
-    aux_stage = pl.create_tensor([T * TOPK, AUX_WIDTH], dtype=pl.FP32)
-    routes = pl.max(0, pl.min(num_tokens, T)) * TOPK
-    workers = pl.max(1, pl.min(routes, 48))
-    with pl.spmd(workers, name_hint="dispatch_push", deps=[_meta_push_tid], allow_early_resolve=False) as _push_tid:
+    active_tokens = pl.max(0, pl.min(num_tokens, T))
+    workers = pl.max(1, pl.min(active_tokens, 48))
+    with pl.spmd(workers, name_hint="dispatch_pack", deps=[_meta_push_tid], allow_early_resolve=False) as _pack_tid:
         worker = pl.tile.get_block_idx()
-        for route in pl.range(worker, routes, workers):
-            token = route // TOPK
-            choice = route % TOPK
-            eid = pl.read(indices, [token, choice])
-            dst = eid // N_LOCAL
-            slot = pl.read(route_slots, [token, choice])
-            start = pl.read(send_starts, [dst, eid % N_LOCAL])
-            row = my_rank * (T * TOPK) + start + slot
-            weight = pl.read(weights, [token, choice])
+        for token in pl.range(worker, active_tokens, workers):
+            # A token has TOPK destinations, but the quantized hidden vector
+            # is shared by all of them. Load it once and reuse the tile for
+            # each destination-major staging row.
+            source = pl.load(x_norm_mx_raw, [token, 0], [1, D])
             factor = pl.read(x_norm_scale, [0, token])
-            metadata = pl.tile.full([1, AUX_WIDTH], dtype=pl.FP32, value=0.0)
-            pl.tile.write(metadata, [0, 0], weight)
-            pl.tile.write(metadata, [0, 1], factor)
-            pl.tile.write(metadata, [0, 2], pl.cast(pl.cast(route, pl.INT32), pl.FP32))
-            pl.store(metadata, [route, 0], aux_stage)
+            for choice in pl.range(TOPK):
+                route = token * TOPK + choice
+                eid = pl.read(indices, [token, choice])
+                dst = eid // N_LOCAL
+                slot = pl.read(route_slots, [token, choice])
+                start = pl.read(send_starts, [dst, eid % N_LOCAL])
+                row = dst * (T * TOPK) + start + slot
+                weight = pl.read(weights, [token, choice])
+                metadata = pl.tile.full([1, AUX_WIDTH], dtype=pl.FP32, value=0.0)
+                pl.tile.write(metadata, [0, 0], weight)
+                pl.tile.write(metadata, [0, 1], factor)
+                pl.tile.write(metadata, [0, 2], pl.cast(pl.cast(route, pl.INT32), pl.FP32))
+                pl.store(metadata, [row, 0], send_aux)
+                pl.store(source, [row, 0], recv_x_out)
+
+    # The receiver computes the same expert prefixes from recv_meta.  One
+    # transfer per destination therefore replaces one transfer per route.
+    with pl.spmd(N_RANKS, name_hint="dispatch_push", deps=[_pack_tid], allow_early_resolve=False) as _push_tid:
+        dst = pl.tile.get_block_idx()
+        total = pl.cast(pl.read(send_totals, [dst]), pl.INDEX)
+        if total > 0:
+            source_base = pl.cast(dst * (T * TOPK), pl.INDEX)
+            destination_base = pl.cast(my_rank * (T * TOPK), pl.INDEX)
             pld.tensor.put(
-                dst=recv_x, peer=dst, src=x_norm_mx_raw,
-                dst_offsets=[row, 0], src_offsets=[token, 0], shape=[1, D],
+                dst=recv_x, peer=dst, src=recv_x_out,
+                dst_offsets=[destination_base, 0], src_offsets=[source_base, 0],
+                shape=[total, D], chunk_rows=RECV_TILE,
             )
             pld.tensor.put(
-                dst=recv_weights, peer=dst, src=aux_stage,
-                dst_offsets=[row, 0], src_offsets=[route, 0], shape=[1, AUX_WIDTH],
+                dst=recv_weights, peer=dst, src=send_aux,
+                dst_offsets=[destination_base, 0], src_offsets=[source_base, 0],
+                shape=[total, AUX_WIDTH], chunk_rows=RECV_TILE,
             )
 
     # Publish one epoch only after every local payload store completes.
@@ -243,12 +270,31 @@ def dispatch(
                     src_base_row = src * (T * TOPK) + pl.cast(pl.read(recv_starts, [src, e]), pl.INDEX)
                     gather_begin = pl.max(tile_row, source_begin)
                     gather_end = pl.min(tile_end, source_end)
+                    # Rows for one source/expert lane are contiguous in the
+                    # transport window. Load their hidden payload once per
+                    # panel and keep the route metadata scalar path below.
+                    gather_rows = gather_end - gather_begin
+                    if gather_rows > 0:
+                        in_row = src_base_row + gather_begin - source_begin
+                        out_row = e_base_row + gather_begin
+                        recv_x_raw = pl.load(
+                            recv_x,
+                            [in_row, 0],
+                            [RECV_TILE, D],
+                            valid_shape=[gather_rows, D],
+                        )
+                        # Keep the function argument as the backing tensor.
+                        # Rebinding it here makes the SSA value created by the
+                        # gather launch escape into the earlier bulk-push
+                        # launch, which fails LegalizeSpmdLaunches.
+                        pl.store(
+                            recv_x_raw,
+                            [out_row, 0],
+                            recv_x_out,
+                        )
                     for out_col in pl.range(gather_begin, gather_end):
                         in_row = src_base_row + out_col - source_begin
                         out_row = e_base_row + out_col
-                        recv_x_raw = pl.load(recv_x, [in_row, 0], [1, D])
-                        recv_x_mx = recv_x_raw
-                        recv_x_out = pl.store(recv_x_mx, [out_row, 0], recv_x_out)
                         factor = pl.read(recv_weights, [in_row, 1])
                         pl.tile.write(gathered_scale, [0, out_col - tile_row], factor)
                         recv_weight = pl.read(recv_weights, [in_row, 0])
@@ -292,22 +338,42 @@ def combine_scattered(
                     expected=moe_epoch, cmp=pld.WaitCmp.Ge,
                 )
 
-    # Wait for local and peer routed-output stores.
-    with pl.spmd(T, name_hint="combine_reduce", deps=[_cwait_tid]) as _reduce_tid:
-        t = pl.tile.get_block_idx()
-        combined = pl.cast(0, pl.INT32)
-        if t < num_tokens:
-            shared_row = pl.load(shared_output, [t, 0], [1, D])
-            acc = pl.cast(shared_row, target_type=pl.FP32)
-            for k in pl.range(TOPK):
-                routed_row = pl.load(routed_output, [t * TOPK + k, 0], [1, D])
-                routed_fp32 = pl.cast(routed_row, target_type=pl.FP32)
-                acc = pl.add(acc, routed_fp32)
-                combined = combined + pl.cast(1, pl.INT32)
-            ffn_row = pl.cast(acc, target_type=pl.BF16, mode="rint")
-            ffn_out = pl.store(ffn_row, [t, 0], ffn_out)
-        pl.write(combined_counts, [t, 0], combined)
-    return _reduce_tid
+    # Wait for local and peer routed-output stores. A two-token panel keeps the
+    # token-major routed rows contiguous while amortizing the 5120-wide loads.
+    combine_blocks = (T + COMBINE_TOKEN_TILE - 1) // COMBINE_TOKEN_TILE
+    with pl.spmd(combine_blocks, name_hint="combine_reduce", deps=[_cwait_tid]) as _reduce_tid:
+        block = pl.tile.get_block_idx()
+        t0 = block * COMBINE_TOKEN_TILE
+        valid_rows = pl.min(COMBINE_TOKEN_TILE, pl.max(num_tokens - t0, 0))
+        if valid_rows > 0:
+            shared_rows = pl.load(shared_output, [t0, 0], [COMBINE_TOKEN_TILE, D])
+            routed_rows = pl.load(
+                routed_output,
+                [t0 * TOPK, 0],
+                [COMBINE_TOKEN_TILE * TOPK, D],
+            )
+            for lane in pl.range(COMBINE_TOKEN_TILE):
+                if lane < valid_rows:
+                    shared_row = pl.tile.slice(shared_rows, [1, D], [lane, 0])
+                    acc = pl.cast(shared_row, target_type=pl.FP32)
+                    route_base = lane * TOPK
+                    for k in pl.range(TOPK):
+                        routed_row = pl.tile.slice(
+                            routed_rows, [1, D], [route_base + k, 0],
+                        )
+                        acc = pl.add(acc, pl.cast(routed_row, target_type=pl.FP32))
+                    ffn_row = pl.cast(acc, target_type=pl.BF16, mode="rint")
+                    ffn_out = pl.store(ffn_row, [t0 + lane, 0], ffn_out)
+    # Every active row contributes TOPK routed outputs. Keep the count metadata
+    # on one block so the 64-byte rows are written without dynamic-index races.
+    with pl.spmd(1, name_hint="combine_counts", deps=[_reduce_tid]) as _counts_tid:
+        worker = pl.tile.get_block_idx()
+        for t in pl.range(worker, T, 1):
+            combined = pl.cast(0, pl.INT32)
+            if t < num_tokens:
+                combined = pl.cast(TOPK, pl.INT32)
+            pl.write(combined_counts, [t, 0], combined)
+    return _counts_tid
 
 
 @pl.jit.inline
@@ -326,12 +392,24 @@ def _compact_local_tokens(
 ):
     """Pack this TP rank's interleaved owner rows into the local-token ABI prefix."""
     local_tokens = _local_token_count(num_tokens, tp_rank)
-    for row in pl.spmd(pl.tensor.dim(compact, 0), name_hint="prefill_moe_compact"):
-        value = pl.tile.full([1, D], dtype=pl.BF16, value=0.0)
-        if row < local_tokens:
-            source_row = row * TP_SIZE + tp_rank
-            value = pl.tile.load(source, [source_row, 0], [1, D])
-        pl.tile.store(value, [row, 0], compact, shapes=[1, D])
+    compact_rows = pl.tensor.dim(compact, 0)
+    compact_blocks = (compact_rows + LOCAL_ROW_TILE - 1) // LOCAL_ROW_TILE
+    with pl.spmd(compact_blocks, name_hint="prefill_moe_compact"):
+        block = pl.tile.get_block_idx()
+        row0 = block * LOCAL_ROW_TILE
+        rows = pl.min(LOCAL_ROW_TILE, pl.max(local_tokens - row0, 0))
+        value = pl.tile.full([LOCAL_ROW_TILE, D], dtype=pl.BF16, value=0.0)
+        for lane in pl.range(LOCAL_ROW_TILE):
+            row = row0 + lane
+            if row < local_tokens:
+                source_row = row * TP_SIZE + tp_rank
+                value[lane : lane + 1, :] = pl.tile.load(source, [source_row, 0], [1, D])
+        pl.tile.store(
+            pl.set_validshape(value, rows, D),
+            [row0, 0],
+            compact,
+            shapes=[LOCAL_ROW_TILE, D],
+        )
     return compact
 
 
@@ -345,12 +423,23 @@ def _scatter_local_tokens(
 ):
     """Scatter compact local MoE rows back into the original TP token positions."""
     local_tokens = _local_token_count(num_tokens, tp_rank)
-    workers = pl.max(1, pl.min(local_tokens, 2 * pl.system.available_cluster_count()))
+    blocks = (local_tokens + LOCAL_ROW_TILE - 1) // LOCAL_ROW_TILE
+    workers = pl.max(1, pl.min(blocks, 2 * pl.system.available_cluster_count()))
     with pl.spmd(workers, name_hint="prefill_moe_scatter", deps=[compact_ready]):
         worker = pl.tile.get_block_idx()
-        for row in pl.range(worker, local_tokens, workers):
-            value = pl.tile.load(compact, [row, 0], [1, D])
-            pl.tile.store(value, [row * TP_SIZE + tp_rank, 0], output, shapes=[1, D])
+        for block in pl.range(worker, blocks, workers):
+            row0 = block * LOCAL_ROW_TILE
+            rows = pl.min(LOCAL_ROW_TILE, local_tokens - row0)
+            value = pl.tile.load(compact, [row0, 0], [LOCAL_ROW_TILE, D])
+            for lane in pl.range(LOCAL_ROW_TILE):
+                if lane < rows:
+                    row = row0 + lane
+                    pl.tile.store(
+                        pl.tile.slice(value, [1, D], [lane, 0]),
+                        [row * TP_SIZE + tp_rank, 0],
+                        output,
+                        shapes=[1, D],
+                    )
     return output
 
 
@@ -396,6 +485,7 @@ def prefill_moe_sublayer(
     ep_rank: pl.Scalar[pl.INT32],
     tp_rank: pl.Scalar[pl.INT32],
     moe_epoch: pl.Scalar[pl.INT32],
+    reuse_deps: pl.Array[1, pl.TASK_ID],
     prefill: pl.constexpr,
 ):
     """Collapse mHC streams, normalize compact TP owner rows, and run the EP MoE."""
@@ -413,24 +503,34 @@ def prefill_moe_sublayer(
         if local_num_tokens > 0:
             local_ffn_input = pl.create_tensor([TOKENS, D], dtype=pl.BF16)
             _compact_local_tokens(ffn_input, local_ffn_input, num_tokens, tp_rank)
-            norm_tokens = pl.tensor.dim(local_ffn_input, 0)
-            for norm_block in pl.spmd((norm_tokens + 7) // 8, name_hint="rms_norm"):
-                rms_norm_tiled(local_ffn_input, ffn_norm_weight, local_ffn_normed, norm_block, norm_tokens, output_fp32=False)
-            npu_gate(
-                local_ffn_normed, gate_weight, correction_bias, local_num_tokens,
-                x_norm_mx, x_norm_scale, indices, weights,
-            )
+            if prefill:
+                scale_view = pl.reshape(x_norm_scale, [TOKENS, 1])
+                gate_input = pl.create_tensor([TOKENS, D], dtype=pl.FP32)
+                prefill_ffn_norm_quant(
+                    local_ffn_input, ffn_norm_weight,
+                    local_ffn_normed, x_norm_mx, scale_view, gate_input,
+                    local_num_tokens, TOKENS,
+                )
+                gate_from_fp32(gate_input, gate_weight, correction_bias, local_num_tokens, indices, weights)
+            else:
+                norm_tokens = pl.tensor.dim(local_ffn_input, 0)
+                for norm_block in pl.spmd((norm_tokens + 7) // 8, name_hint="rms_norm"):
+                    rms_norm_tiled(local_ffn_input, ffn_norm_weight, local_ffn_normed, norm_block, norm_tokens, output_fp32=False)
+                npu_gate(
+                    local_ffn_normed, gate_weight, correction_bias, local_num_tokens,
+                    x_norm_mx, x_norm_scale, indices, weights,
+                )
 
             expert_shared(
                 x_norm_mx, x_norm_scale,
                 shared_w1, shared_w1_scale,
                 shared_w3, shared_w3_scale,
                 shared_w2, shared_w2_scale,
-                shared_output, local_num_tokens, True,
+                shared_output, local_num_tokens, True, prefill,
             )
         else:
             workers = pl.min(48, TOKENS // 4)
-            with pl.spmd(workers, name_hint="moe_empty_owner"):
+            with pl.spmd(workers, name_hint="moe_empty_owner", deps=[reuse_deps]) as empty_owner:
                 worker = pl.tile.get_block_idx()
                 for group in pl.range(worker, TOKENS // 4, workers):
                     first = group * 4
@@ -452,7 +552,7 @@ def prefill_moe_sublayer(
             recv_x_local, recv_scale_local_backing,
             recv_weight_local, recv_route_local, recv_count_local, recv_meta_local,
             recv_meta, recv_x, recv_weights,
-            arrived, data_arrived, local_num_tokens, ep_rank, moe_epoch,
+            arrived, data_arrived, local_num_tokens, ep_rank, moe_epoch, reuse_deps,
         )
 
         scatter_done = expert_routed_scatter(
@@ -461,7 +561,7 @@ def prefill_moe_sublayer(
             routed_w1, routed_w1_scale, routed_w3, routed_w3_scale,
             routed_w2, routed_w2_scale,
             recv_route_local,
-            routed_output, input_ready,
+            routed_output, input_ready, prefill,
         )
         combined_counts = pl.create_tensor([TOKENS, 16], dtype=pl.INT32)
         output_ready = combine_scattered(
@@ -514,12 +614,15 @@ def prefill_ffn_restore(
     tp_rank: pl.Scalar[pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
     ffn_epoch: pl.Scalar[pl.INT32],
-    prefill: pl.constexpr,
+    prefill: pl.constexpr = False,
 ):
     """Sum TP routed partials and expand the residual stream with mHC."""
     prefill_tp_output_all_reduce(
         ffn_owned, ffn_window, ffn_arrived, ffn_output, group_base, tp_rank, num_tokens, ffn_epoch, owner_rows=True,
     )
     hc_post_deps = pl.array.create(2, pl.TASK_ID)
-    hc_post(ffn_output, x_hc, post_mix, residual_mix, x_hc_out, deps=hc_post_deps, prefill=prefill)
+    hc_post(
+        ffn_output, x_hc, post_mix, residual_mix, x_hc_out,
+        deps=hc_post_deps, prefill=prefill,
+    )
     return x_hc_out
