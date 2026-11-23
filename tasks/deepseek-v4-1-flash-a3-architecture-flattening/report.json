@@ -1,0 +1,24 @@
+{
+  "schema": 1,
+  "type": "model",
+  "name": "Flatten the DeepSeek A3 model graph",
+  "goal": "Compare the integrated graph before and after the active operators move out of the nested directory.",
+  "config": {
+    "Baseline": "4dfe05fc00f80f901306bca8ae478c03e93893fd",
+    "Candidate": "3acf570d28f2bca3a7821c598e136088b8f8e050",
+    "Upstream baseline": "321e3a4fe6185c3ff09df453efab9eecc0e26a45",
+    "Upstream candidate": "2ed6d8724fe01484bc7b25bf643ca7f72dbcbcf1",
+    "Workload": "A3 W8A8 · 8K Prefill · 8 output · batch 1",
+    "Timing": "resident_phase_us"
+  },
+  "metrics": [
+    {
+      "key": "worst_baseline_ratio",
+      "label": "Worst candidate / baseline latency ratio",
+      "unit": "x",
+      "direction": "lower",
+      "decimals": 3,
+      "description": "Largest paired ratio over the named latency cases after correctness checks."
+    }
+  ]
+}

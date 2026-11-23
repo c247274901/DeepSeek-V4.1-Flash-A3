@@ -1,0 +1,24 @@
+{
+  "schema": 1,
+  "type": "kernel",
+  "name": "Decode mHC Post tiling",
+  "goal": "Compare the applicable slab sizes with the same hidden, residual and mix tensors.",
+  "config": {
+    "Baseline": "fd4620b9eb433c0ecfb24871f2b5f22847218cc5",
+    "Candidate": "a6a3ba7d8f5651722b9cb45e31cc9c7bea93307c",
+    "Upstream baseline": "8e86521c512a9e473b30e34fdecd2505b5baed69",
+    "Upstream candidate": "4f87af0d59a8046102e186b89d4b210b061aee2f",
+    "Workload": "A3 W8A8 · 8K Prefill · 8 output · batch 1",
+    "Timing": "synchronous_full_entry_us"
+  },
+  "metrics": [
+    {
+      "key": "worst_baseline_ratio",
+      "label": "Worst candidate / baseline latency ratio",
+      "unit": "x",
+      "direction": "lower",
+      "decimals": 3,
+      "description": "Largest paired ratio over the named latency cases after correctness checks."
+    }
+  ]
+}

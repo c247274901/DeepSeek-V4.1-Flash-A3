@@ -1,0 +1,24 @@
+{
+  "schema": 1,
+  "type": "kernel",
+  "name": "Prefill MoE routing and dispatch",
+  "goal": "Hold token distribution and expert metadata constant while comparing gate and dispatch changes.",
+  "config": {
+    "Baseline": "a6a3ba7d8f5651722b9cb45e31cc9c7bea93307c",
+    "Candidate": "2bd279d470e3d061fadd75a72aad2bb52ce83571",
+    "Upstream baseline": "4f87af0d59a8046102e186b89d4b210b061aee2f",
+    "Upstream candidate": "38c77a9817090609d74728f24bccea9fb1a682ac",
+    "Workload": "A3 W8A8 · 8K Prefill · 8 output · batch 1",
+    "Timing": "synchronous_full_entry_us"
+  },
+  "metrics": [
+    {
+      "key": "worst_baseline_ratio",
+      "label": "Worst candidate / baseline latency ratio",
+      "unit": "x",
+      "direction": "lower",
+      "decimals": 3,
+      "description": "Largest paired ratio over the named latency cases after correctness checks."
+    }
+  ]
+}

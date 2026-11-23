@@ -1,0 +1,24 @@
+{
+  "schema": 1,
+  "type": "kernel",
+  "name": "Fuse Decode KV normalization and RoPE",
+  "goal": "Keep the norm input, weights, positions and cache stores identical.",
+  "config": {
+    "Baseline": "79fd9d856e1ed8c77f861df7d407d430498c2c17",
+    "Candidate": "415780225601565379a6979a5fd91490ee25e354",
+    "Upstream baseline": "2a0c19a028b03fe36f8d74341bb1cc5c6c505503",
+    "Upstream candidate": "effd2b2c963f7e4aed727751853ef62d2101bf5f",
+    "Workload": "A3 W8A8 · 8K Prefill · 8 output · batch 1",
+    "Timing": "synchronous_full_entry_us"
+  },
+  "metrics": [
+    {
+      "key": "worst_baseline_ratio",
+      "label": "Worst candidate / baseline latency ratio",
+      "unit": "x",
+      "direction": "lower",
+      "decimals": 3,
+      "description": "Largest paired ratio over the named latency cases after correctness checks."
+    }
+  ]
+}

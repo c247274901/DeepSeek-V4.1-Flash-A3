@@ -1,0 +1,62 @@
+{
+  "schema": 1,
+  "files": [
+    "README.md",
+    "goal.md",
+    "input.json",
+    "workflow.md"
+  ],
+  "engines": [
+    null
+  ],
+  "backends": [
+    "A3"
+  ],
+  "validation_statuses": [
+    "passed"
+  ],
+  "metrics": {
+    "worst_baseline_ratio": {
+      "unit": "x",
+      "direction": "lower",
+      "required": true,
+      "source": {
+        "path": "evidence/comparison.json",
+        "pointer": "/worst_baseline_ratio"
+      }
+    }
+  },
+  "evidence": [
+    "evidence/fixtures.json",
+    "evidence/baseline.json",
+    "evidence/candidate.json",
+    "evidence/comparison.json"
+  ],
+  "checks": [
+    {
+      "path": "evidence/comparison.json",
+      "pointer": "/input_contract",
+      "equals_task_json": "input.json"
+    },
+    {
+      "path": "evidence/comparison.json",
+      "pointer": "/baseline_revision",
+      "equals": "c74d9bc70c8d6c415ae00c1e710813d558dfc1f2"
+    },
+    {
+      "path": "evidence/comparison.json",
+      "pointer": "/candidate_revision",
+      "equals": "9c05078de6ec94318a8e80863012f9ac96d53236"
+    },
+    {
+      "path": "evidence/comparison.json",
+      "pointer": "/cases",
+      "nonempty": true
+    },
+    {
+      "path": "evidence/comparison.json",
+      "pointer": "/correctness_passed",
+      "equals": true
+    }
+  ]
+}

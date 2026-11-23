@@ -1,0 +1,24 @@
+{
+  "schema": 1,
+  "type": "kernel",
+  "name": "Prefill Indexer scheduling",
+  "goal": "Replay the Indexer with the same cache pages, positions and candidate set.",
+  "config": {
+    "Baseline": "c74d9bc70c8d6c415ae00c1e710813d558dfc1f2",
+    "Candidate": "9c05078de6ec94318a8e80863012f9ac96d53236",
+    "Upstream baseline": "b60a1c7d4604a488f0b7b6575efc4bfbce32b23f",
+    "Upstream candidate": "79dd5d775eaab9c2a02fb6e0d81c6679905bfa0d",
+    "Workload": "A3 W8A8 · 8K Prefill · 8 output · batch 1",
+    "Timing": "synchronous_full_entry_us"
+  },
+  "metrics": [
+    {
+      "key": "worst_baseline_ratio",
+      "label": "Worst candidate / baseline latency ratio",
+      "unit": "x",
+      "direction": "lower",
+      "decimals": 3,
+      "description": "Largest paired ratio over the named latency cases after correctness checks."
+    }
+  ]
+}

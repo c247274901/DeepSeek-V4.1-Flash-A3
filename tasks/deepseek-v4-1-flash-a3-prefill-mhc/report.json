@@ -1,0 +1,24 @@
+{
+  "schema": 1,
+  "type": "kernel",
+  "name": "Prefill mHC kernels",
+  "goal": "Use the same hidden rows and residual mixing inputs for mHC Pre, Post and collapse.",
+  "config": {
+    "Baseline": "da9b4ab61ae439b1277b8a37942ef3d38594debf",
+    "Candidate": "22281c2804663f3760f99a320a0988b1294a6c80",
+    "Upstream baseline": "3604caa36fe743c699e8c997a0d9081161ba2e83",
+    "Upstream candidate": "fd6c856d983f520c6c131c3af49c5375d2b6c385",
+    "Workload": "A3 W8A8 · 8K Prefill · 8 output · batch 1",
+    "Timing": "synchronous_full_entry_us"
+  },
+  "metrics": [
+    {
+      "key": "worst_baseline_ratio",
+      "label": "Worst candidate / baseline latency ratio",
+      "unit": "x",
+      "direction": "lower",
+      "decimals": 3,
+      "description": "Largest paired ratio over the named latency cases after correctness checks."
+    }
+  ]
+}

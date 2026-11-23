@@ -1,0 +1,24 @@
+{
+  "schema": 1,
+  "type": "kernel",
+  "name": "Prefill expert GEMM",
+  "goal": "Freeze per-expert occupancy, packed W8A8 rows and scales before replay.",
+  "config": {
+    "Baseline": "22281c2804663f3760f99a320a0988b1294a6c80",
+    "Candidate": "2ae6005793a9b3ed5485c48a0b87049816af4bd9",
+    "Upstream baseline": "fd6c856d983f520c6c131c3af49c5375d2b6c385",
+    "Upstream candidate": "5c153593abec6ca0d6c6fa253495d2d3e5257d3e",
+    "Workload": "A3 W8A8 · 8K Prefill · 8 output · batch 1",
+    "Timing": "synchronous_full_entry_us"
+  },
+  "metrics": [
+    {
+      "key": "worst_baseline_ratio",
+      "label": "Worst candidate / baseline latency ratio",
+      "unit": "x",
+      "direction": "lower",
+      "decimals": 3,
+      "description": "Largest paired ratio over the named latency cases after correctness checks."
+    }
+  ]
+}

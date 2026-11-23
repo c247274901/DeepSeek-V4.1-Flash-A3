@@ -1,0 +1,24 @@
+{
+  "schema": 1,
+  "type": "model",
+  "name": "Integrate full Prefill and Decode graphs",
+  "goal": "Compare staged and resident execution with the two distributed forward programs and shared paged history.",
+  "config": {
+    "Baseline": "c43f180503f3034681977108a038d8c393ca0ddf",
+    "Candidate": "df1307df08fb694df5a2a8f71d66c67eee708f17",
+    "Upstream baseline": "5ed8c50e02b8cdef1e26c9d66f5cf1d557c8b6a5",
+    "Upstream candidate": "10a50c2e7e91d5538b27836f5ac6b710731fee32",
+    "Workload": "A3 W8A8 · 8K Prefill · 8 output · batch 1",
+    "Timing": "resident_phase_us"
+  },
+  "metrics": [
+    {
+      "key": "worst_baseline_ratio",
+      "label": "Worst candidate / baseline latency ratio",
+      "unit": "x",
+      "direction": "lower",
+      "decimals": 3,
+      "description": "Largest paired ratio over the named latency cases after correctness checks."
+    }
+  ]
+}

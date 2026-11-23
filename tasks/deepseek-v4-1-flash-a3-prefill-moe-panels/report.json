@@ -1,0 +1,24 @@
+{
+  "schema": 1,
+  "type": "kernel",
+  "name": "Prefill MoE routing panels",
+  "goal": "Keep selected expert IDs, routing weights, packet order and slab ownership fixed.",
+  "config": {
+    "Baseline": "7dea2f421421216f05c6b0b038ed0d11dc697b84",
+    "Candidate": "7d6e410c337892b028372bfc7fa6df6e2570da66",
+    "Upstream baseline": "9975aa28aef2bf225f0e4f095db4a313176aac0e",
+    "Upstream candidate": "1753c6f8b1e4d0e5268aa1a5cf7e2684f97a7163",
+    "Workload": "A3 W8A8 · 8K Prefill · 8 output · batch 1",
+    "Timing": "synchronous_full_entry_us"
+  },
+  "metrics": [
+    {
+      "key": "worst_baseline_ratio",
+      "label": "Worst candidate / baseline latency ratio",
+      "unit": "x",
+      "direction": "lower",
+      "decimals": 3,
+      "description": "Largest paired ratio over the named latency cases after correctness checks."
+    }
+  ]
+}

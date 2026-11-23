@@ -1,0 +1,24 @@
+{
+  "schema": 1,
+  "type": "kernel",
+  "name": "Prefill sparse attention",
+  "goal": "Keep query/KV planes, pool indices and slot validity fixed across the compared entry points.",
+  "config": {
+    "Baseline": "e48daefd4df711b1232719eaaa705490179fba07",
+    "Candidate": "0b8c1a6ea37ce4db8b447683a8318929ebe8c7c8",
+    "Upstream baseline": "48a1b91d2b89449ac9bc163af92bb20045c08f8b",
+    "Upstream candidate": "f4e5ea2a7eb1fcd1b003f587f17a75b67450f7d6",
+    "Workload": "A3 W8A8 · 8K Prefill · 8 output · batch 1",
+    "Timing": "synchronous_full_entry_us"
+  },
+  "metrics": [
+    {
+      "key": "worst_baseline_ratio",
+      "label": "Worst candidate / baseline latency ratio",
+      "unit": "x",
+      "direction": "lower",
+      "decimals": 3,
+      "description": "Largest paired ratio over the named latency cases after correctness checks."
+    }
+  ]
+}

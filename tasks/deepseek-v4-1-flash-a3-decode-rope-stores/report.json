@@ -1,0 +1,24 @@
+{
+  "schema": 1,
+  "type": "kernel",
+  "name": "Decode RoPE stores",
+  "goal": "Compare the same current positions and output layouts after splitting the stores.",
+  "config": {
+    "Baseline": "59bf9b8de6f1621f1e8a129a0a3d64669cffadda",
+    "Candidate": "7dea2f421421216f05c6b0b038ed0d11dc697b84",
+    "Upstream baseline": "8ad5781d6378bcde455493b0303148e0ea580492",
+    "Upstream candidate": "9975aa28aef2bf225f0e4f095db4a313176aac0e",
+    "Workload": "A3 W8A8 · 8K Prefill · 8 output · batch 1",
+    "Timing": "synchronous_full_entry_us"
+  },
+  "metrics": [
+    {
+      "key": "worst_baseline_ratio",
+      "label": "Worst candidate / baseline latency ratio",
+      "unit": "x",
+      "direction": "lower",
+      "decimals": 3,
+      "description": "Largest paired ratio over the named latency cases after correctness checks."
+    }
+  ]
+}

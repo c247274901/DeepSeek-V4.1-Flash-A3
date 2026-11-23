@@ -1,0 +1,24 @@
+{
+  "schema": 1,
+  "type": "kernel",
+  "name": "Prefill mHC Sinkhorn reductions",
+  "goal": "Compare the reduction schedule with the same active and padded row sizes.",
+  "config": {
+    "Baseline": "78503a986b7d107a022ae7fc58de317017df4536",
+    "Candidate": "1b00b9454cb0214ba9942bdff8eb37673fc1e487",
+    "Upstream baseline": "c0d185715e662d11c9565d776e0091ee3f232571",
+    "Upstream candidate": "0c175caf2f94a3e5c376c6f5168835604b39ea58",
+    "Workload": "A3 W8A8 · 8K Prefill · 8 output · batch 1",
+    "Timing": "synchronous_full_entry_us"
+  },
+  "metrics": [
+    {
+      "key": "worst_baseline_ratio",
+      "label": "Worst candidate / baseline latency ratio",
+      "unit": "x",
+      "direction": "lower",
+      "decimals": 3,
+      "description": "Largest paired ratio over the named latency cases after correctness checks."
+    }
+  ]
+}

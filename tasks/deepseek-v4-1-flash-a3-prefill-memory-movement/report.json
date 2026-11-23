@@ -1,0 +1,24 @@
+{
+  "schema": 1,
+  "type": "kernel",
+  "name": "Prefill memory movement",
+  "goal": "Replay copy, pack and gather with identical source pages, valid rows, offsets and fill values.",
+  "config": {
+    "Baseline": "d6caf0f588cbd78941b58dca07324a8292c60518",
+    "Candidate": "fa5dfb6404c73454dc4693a9c153bef539777a6c",
+    "Upstream baseline": "6371633072955fa5094e423a97f20e56fb1549fc",
+    "Upstream candidate": "038d297e4c128e7a90970170ac7b91e5a837f607",
+    "Workload": "A3 W8A8 · 8K Prefill · 8 output · batch 1",
+    "Timing": "synchronous_full_entry_us"
+  },
+  "metrics": [
+    {
+      "key": "worst_baseline_ratio",
+      "label": "Worst candidate / baseline latency ratio",
+      "unit": "x",
+      "direction": "lower",
+      "decimals": 3,
+      "description": "Largest paired ratio over the named latency cases after correctness checks."
+    }
+  ]
+}

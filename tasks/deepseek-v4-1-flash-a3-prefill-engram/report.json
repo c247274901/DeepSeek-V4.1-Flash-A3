@@ -1,0 +1,24 @@
+{
+  "schema": 1,
+  "type": "kernel",
+  "name": "Prefill Engram unrotation",
+  "goal": "Verify the same gathered Engram rows and blocked rotation weights in both revisions.",
+  "config": {
+    "Baseline": "7d6e410c337892b028372bfc7fa6df6e2570da66",
+    "Candidate": "da9b4ab61ae439b1277b8a37942ef3d38594debf",
+    "Upstream baseline": "1753c6f8b1e4d0e5268aa1a5cf7e2684f97a7163",
+    "Upstream candidate": "3604caa36fe743c699e8c997a0d9081161ba2e83",
+    "Workload": "A3 W8A8 · 8K Prefill · 8 output · batch 1",
+    "Timing": "synchronous_full_entry_us"
+  },
+  "metrics": [
+    {
+      "key": "worst_baseline_ratio",
+      "label": "Worst candidate / baseline latency ratio",
+      "unit": "x",
+      "direction": "lower",
+      "decimals": 3,
+      "description": "Largest paired ratio over the named latency cases after correctness checks."
+    }
+  ]
+}

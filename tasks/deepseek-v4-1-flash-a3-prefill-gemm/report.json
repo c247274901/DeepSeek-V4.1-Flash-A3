@@ -1,0 +1,24 @@
+{
+  "schema": 1,
+  "type": "kernel",
+  "name": "Prefill GEMM projections",
+  "goal": "Compare Q/KV and Engram projection layouts and tiling on the same W8A8 activation rows.",
+  "config": {
+    "Baseline": "fa5dfb6404c73454dc4693a9c153bef539777a6c",
+    "Candidate": "120f3a0f5cfd9892a398a4a6994fd724a6af3fbe",
+    "Upstream baseline": "038d297e4c128e7a90970170ac7b91e5a837f607",
+    "Upstream candidate": "1274027da5063c7a61df5391acb95d4e9c72e344",
+    "Workload": "A3 W8A8 · 8K Prefill · 8 output · batch 1",
+    "Timing": "synchronous_full_entry_us"
+  },
+  "metrics": [
+    {
+      "key": "worst_baseline_ratio",
+      "label": "Worst candidate / baseline latency ratio",
+      "unit": "x",
+      "direction": "lower",
+      "decimals": 3,
+      "description": "Largest paired ratio over the named latency cases after correctness checks."
+    }
+  ]
+}

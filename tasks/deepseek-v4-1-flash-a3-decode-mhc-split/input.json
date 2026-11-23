@@ -1,0 +1,37 @@
+{
+  "schema": 1,
+  "model": "DeepSeek-V4.1-Flash-W8A8",
+  "backend": "A3",
+  "phase": "decode",
+  "revisions": {
+    "baseline": "9c05078de6ec94318a8e80863012f9ac96d53236",
+    "candidate": "d572e5b3384069ec1e34e1045328b4744843302d"
+  },
+  "source_revisions": {
+    "baseline": "79dd5d775eaab9c2a02fb6e0d81c6679905bfa0d",
+    "candidate": "640df027b31928c0fedf24a5e54d85bb5681d681"
+  },
+  "reference_run": {
+    "input_tokens": 8192,
+    "global_batch_size": 1,
+    "prefill_chunk_tokens": 8192,
+    "output_tokens": 8,
+    "context_tokens": 8200,
+    "devices": 16,
+    "parallelism": {
+      "dp": 4,
+      "tp": 4,
+      "ep": 16
+    }
+  },
+  "required_cases": [
+    "decode_mhc"
+  ],
+  "measurement": {
+    "metric": "synchronous_full_entry_us",
+    "windows": 3,
+    "warmup_per_window": 5,
+    "samples_per_window": 100,
+    "statistic": "median_of_window_medians"
+  }
+}

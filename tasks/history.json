@@ -1,0 +1,973 @@
+{
+  "schema": 1,
+  "sources": {
+    "model": "https://github.com/Adelaide999/pypto-lib/tree/deepseek_v4.1_flash_1122",
+    "serving": "https://github.com/Adelaide999/pypto-serving/tree/codex/deepseek-v41-a3-serving-20261116"
+  },
+  "model_snapshot": "2bd279d470e3d061fadd75a72aad2bb52ce83571",
+  "baselines": {
+    "baseline/architecture-after": "3acf570d28f2bca3a7821c598e136088b8f8e050",
+    "baseline/architecture-before": "c43f180503f3034681977108a038d8c393ca0ddf",
+    "baseline/full-graph-entry": "df1307df08fb694df5a2a8f71d66c67eee708f17",
+    "baseline/pre-flatten": "4dfe05fc00f80f901306bca8ae478c03e93893fd"
+  },
+  "commits": [
+    {
+      "source": "5ed8c50e02b8cdef1e26c9d66f5cf1d557c8b6a5",
+      "commit": "c43f180503f3034681977108a038d8c393ca0ddf",
+      "parents": [],
+      "title": "Add: import the pre-integration A3 graph baseline",
+      "baseline": null,
+      "changed_model_files": [
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/MODULE_ALIGNMENT.md",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/README.md",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/__init__.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/activation.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/cache.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/cache_pool.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/compressor.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/config.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/decode_c1a.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/decode_c2a.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/decode_compressed_attention.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/decode_config.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/decode_fwd.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/decode_layer.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/decode_layer_config.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/decode_moe.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/decode_moe_ep.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/decode_network.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/decode_sparse_attention.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/decode_swa.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/engram.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/engram_host.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/expert_routed.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/gemm.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/generate.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/grouped_moe.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/hc.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/indexer.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/input_pack.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/kernels/prefill_output_projection.cpp",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/lm_head.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/metadata.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/moe_transport.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/network.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/o_proj.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/operator_config.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/paged_indexer.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/prefill.example.json",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/prefill_c2a.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/prefill_compressed_reuse.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/prefill_compressed_runtime.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/prefill_consumer_runtime.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/prefill_fwd.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/prefill_indexer.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/prefill_indexer_validation.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/prefill_layer.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/prefill_layer_plan.json",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/prefill_moe.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/prefill_network_engram.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/prefill_prepare.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/prefill_resident.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/prefill_sparse_attention.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/prefill_swa.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/prefill_vector_launch.cpp",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/prefill_vector_launch.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/qkv_proj_rope.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/quant.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/resident_weights.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/rmsnorm.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/rope.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/runtime_config.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/sparse_attention.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/state.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/swa.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/utils.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/weights.py"
+      ],
+      "status": "retained"
+    },
+    {
+      "source": "10a50c2e7e91d5538b27836f5ac6b710731fee32",
+      "commit": "df1307df08fb694df5a2a8f71d66c67eee708f17",
+      "parents": [
+        "c43f180503f3034681977108a038d8c393ca0ddf"
+      ],
+      "title": "Add: run DeepSeek V4.1 Flash with separate A3 forward graphs",
+      "baseline": "c43f180503f3034681977108a038d8c393ca0ddf",
+      "changed_model_files": [
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/MODULE_ALIGNMENT.md",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/README.md",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/__init__.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/bounded_decode.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/cache.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/decode_fwd.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/decode_replay_inputs.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/driver.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/generate.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/generation.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/host.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/network.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/operators/__init__.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/operators/communication.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/operators/compressor.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/operators/config.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/operators/decode_c1a_full.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/operators/decode_c1a_reindex.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/operators/decode_c1a_reuse.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/operators/decode_c2a_full.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/operators/decode_c2a_reuse.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/operators/decode_indexer.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/operators/decode_swa.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/operators/engram.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/operators/expert_routed.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/operators/expert_shared.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/operators/gate.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/operators/gemm.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/operators/hc.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/operators/indexer_reference.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/operators/input_pack.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/operators/lm_head.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/operators/moe.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/operators/o_proj.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/operators/prefill_c1a_full.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/operators/prefill_c1a_reindex.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/operators/prefill_c1a_reuse.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/operators/prefill_c2a_full.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/operators/prefill_c2a_reuse.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/operators/prefill_cp_allgather.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/operators/prefill_indexer.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/operators/prefill_swa.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/operators/qkv_proj_rope.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/operators/quant.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/operators/rmsnorm.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/operators/rope_tables.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/operators/softmax_precision.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/operators/sparse_attention.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/operators/utils.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/operators/weights.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/prefill_compressed_runtime.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/prefill_consumer_runtime.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/prefill_fwd.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/prefill_layer.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/prefill_moe.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/prefill_resident.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/reference.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/replay.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/resident_decode.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/resident_decode_entry.cpp",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/resident_memory.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/resident_mesh.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/routed_exchange.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/staged_generate.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/staged_prefill.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/state.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/swimlane.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/telemetry.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/tp_exchange.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/validation.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/validation_data/input_ids.json",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/weights.py"
+      ],
+      "status": "retained",
+      "task": "deepseek-v4-1-flash-a3-architecture-integration"
+    },
+    {
+      "source": "321e3a4fe6185c3ff09df453efab9eecc0e26a45",
+      "commit": "4dfe05fc00f80f901306bca8ae478c03e93893fd",
+      "parents": [
+        "df1307df08fb694df5a2a8f71d66c67eee708f17"
+      ],
+      "title": "Perf: reduce DeepSeek V4.1 Flash A3 prefill and decode latency",
+      "baseline": "df1307df08fb694df5a2a8f71d66c67eee708f17",
+      "changed_model_files": [
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/decode_fwd.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/driver.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/generation.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/host.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/operators/communication.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/operators/config.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/operators/decode_c1a_full.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/operators/decode_c1a_reindex.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/operators/decode_c1a_reuse.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/operators/decode_c2a_full.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/operators/decode_c2a_reuse.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/operators/decode_indexer.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/operators/decode_swa.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/operators/engram.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/operators/expert_routed.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/operators/expert_shared.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/operators/gate.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/operators/gemm.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/operators/hc.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/operators/moe.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/operators/o_proj.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/operators/prefill_c1a_full.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/operators/prefill_c1a_reindex.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/operators/prefill_c1a_reuse.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/operators/prefill_c2a_reuse.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/operators/prefill_indexer.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/operators/prefill_swa.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/operators/qkv_proj_rope.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/operators/quant.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/operators/sparse_attention.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/operators/utils.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/operators/weights.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/prefill_fwd.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/quant.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/replay.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/rmsnorm.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/rope.py"
+      ],
+      "status": "retained"
+    },
+    {
+      "source": "2ed6d8724fe01484bc7b25bf643ca7f72dbcbcf1",
+      "commit": "3acf570d28f2bca3a7821c598e136088b8f8e050",
+      "parents": [
+        "4dfe05fc00f80f901306bca8ae478c03e93893fd"
+      ],
+      "title": "Refactor: flatten the DeepSeek V4.1 Flash A3 full graph",
+      "baseline": "4dfe05fc00f80f901306bca8ae478c03e93893fd",
+      "changed_model_files": [
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/MODULE_ALIGNMENT.md",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/README.md",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/__init__.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/activation.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/activation_quant.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/blocked_rmsnorm.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/bounded_decode.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/cache.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/cache_pool.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/compressor.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/config.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/decode_c1a.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/decode_c1a_full.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/decode_c1a_reindex.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/decode_c1a_reuse.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/decode_c2a.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/decode_c2a_full.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/decode_c2a_reuse.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/decode_compressed_attention.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/decode_config.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/decode_fwd.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/decode_indexer.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/decode_layer.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/decode_layer_config.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/decode_moe.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/decode_moe_ep.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/decode_network.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/decode_replay_inputs.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/decode_sparse_attention.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/decode_swa.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/device_views.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/driver.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/engram.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/engram_host.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/expert_routed.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/expert_shared.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/gate.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/gemm.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/generate.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/generation.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/grouped_moe.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/hc.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/host.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/indexer.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/indexer_reference.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/input_ids.json",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/input_pack.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/kernels/prefill_output_projection.cpp",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/lm_head.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/metadata.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/moe.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/moe_transport.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/network.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/o_proj.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/operator_config.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/operators/__init__.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/operators/communication.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/operators/compressor.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/operators/config.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/operators/decode_c1a_full.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/operators/decode_c1a_reindex.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/operators/decode_c1a_reuse.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/operators/decode_c2a_full.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/operators/decode_c2a_reuse.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/operators/decode_indexer.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/operators/decode_swa.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/operators/engram.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/operators/expert_routed.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/operators/expert_shared.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/operators/gate.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/operators/gemm.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/operators/hc.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/operators/indexer_reference.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/operators/input_pack.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/operators/lm_head.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/operators/moe.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/operators/o_proj.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/operators/prefill_c1a_full.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/operators/prefill_c1a_reindex.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/operators/prefill_c1a_reuse.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/operators/prefill_c2a_full.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/operators/prefill_c2a_reuse.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/operators/prefill_cp_allgather.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/operators/prefill_indexer.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/operators/prefill_swa.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/operators/qkv_proj_rope.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/operators/quant.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/operators/rmsnorm.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/operators/rope_tables.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/operators/softmax_precision.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/operators/sparse_attention.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/operators/utils.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/operators/weights.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/paged_indexer.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/prefill.example.json",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/prefill_c1a_full.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/prefill_c1a_reindex.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/prefill_c1a_reuse.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/prefill_c2a.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/prefill_c2a_full.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/prefill_c2a_reuse.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/prefill_compressed_reuse.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/prefill_compressed_runtime.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/prefill_consumer_runtime.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/prefill_cp_allgather.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/prefill_fwd.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/prefill_indexer.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/prefill_indexer_validation.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/prefill_layer.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/prefill_layer_plan.json",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/prefill_moe.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/prefill_network_engram.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/prefill_prepare.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/prefill_resident.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/prefill_sparse_attention.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/prefill_swa.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/prefill_vector_launch.cpp",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/prefill_vector_launch.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/qkv_proj_rope.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/quant.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/reference.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/replay.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/resident_decode.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/resident_decode_entry.cpp",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/resident_memory.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/resident_mesh.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/resident_weights.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/rmsnorm.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/rope.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/rope_tables.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/routed_exchange.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/runtime_config.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/softmax_precision.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/sparse_attention.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/staged_generate.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/staged_prefill.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/state.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/swa.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/tp_exchange.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/utils.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/validation.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/validation_data/input_ids.json",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/weights.py"
+      ],
+      "status": "retained",
+      "task": "deepseek-v4-1-flash-a3-architecture-flattening"
+    },
+    {
+      "source": "53ea3e6d03f54fb62507ada6570ba94069269edd",
+      "commit": "1f19ddc7dc25dc01efbe0d46199893192c1b2959",
+      "parents": [
+        "3acf570d28f2bca3a7821c598e136088b8f8e050"
+      ],
+      "title": "Perf: reduce DeepSeek V4.1 Flash A3 prefill latency",
+      "baseline": "3acf570d28f2bca3a7821c598e136088b8f8e050",
+      "changed_model_files": [
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/prefill_indexer.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/qkv_proj_rope.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/rope.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/sparse_attention.py"
+      ],
+      "status": "retained"
+    },
+    {
+      "source": "2a0c19a028b03fe36f8d74341bb1cc5c6c505503",
+      "commit": "79fd9d856e1ed8c77f861df7d407d430498c2c17",
+      "parents": [
+        "1f19ddc7dc25dc01efbe0d46199893192c1b2959"
+      ],
+      "title": "Perf: split Decode projections from Prefill GEMM schedule",
+      "baseline": "1f19ddc7dc25dc01efbe0d46199893192c1b2959",
+      "changed_model_files": [
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/activation_quant.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/gemm.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/qkv_proj_rope.py"
+      ],
+      "status": "retained"
+    },
+    {
+      "source": "effd2b2c963f7e4aed727751853ef62d2101bf5f",
+      "commit": "415780225601565379a6979a5fd91490ee25e354",
+      "parents": [
+        "79fd9d856e1ed8c77f861df7d407d430498c2c17"
+      ],
+      "title": "Perf: fuse Decode KV normalization and RoPE",
+      "baseline": "79fd9d856e1ed8c77f861df7d407d430498c2c17",
+      "changed_model_files": [
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/activation_quant.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/qkv_proj_rope.py"
+      ],
+      "status": "retained",
+      "task": "deepseek-v4-1-flash-a3-decode-kv-norm-rope"
+    },
+    {
+      "source": "96dc8583c1f61d913dd42d9877452182540dc68d",
+      "commit": "27992c9932a1df9b1b56968eb8e9f640890cbc6b",
+      "parents": [
+        "415780225601565379a6979a5fd91490ee25e354"
+      ],
+      "title": "Fix: use portable Decode RMSNorm rsqrt",
+      "baseline": "415780225601565379a6979a5fd91490ee25e354",
+      "changed_model_files": [
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/activation_quant.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/qkv_proj_rope.py"
+      ],
+      "status": "retained"
+    },
+    {
+      "source": "f1b76579776e7049f5ac330927970ed42ddb898c",
+      "commit": "f93878ff617a5fbb0f63f4987d19719bd48faa16",
+      "parents": [
+        "27992c9932a1df9b1b56968eb8e9f640890cbc6b"
+      ],
+      "title": "Fix: use shared RMSNorm reduction path",
+      "baseline": "27992c9932a1df9b1b56968eb8e9f640890cbc6b",
+      "changed_model_files": [
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/activation_quant.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/qkv_proj_rope.py"
+      ],
+      "status": "retained"
+    },
+    {
+      "source": "e0976572ee09824fbff30012f6c23e5c3a3ea7d4",
+      "commit": "e7d6062768a89163e1eeb3385325e2c7239e50b1",
+      "parents": [
+        "f93878ff617a5fbb0f63f4987d19719bd48faa16"
+      ],
+      "title": "Fix: annotate portable tile rsqrt helper",
+      "baseline": "f93878ff617a5fbb0f63f4987d19719bd48faa16",
+      "changed_model_files": [
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/activation_quant.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/qkv_proj_rope.py"
+      ],
+      "status": "retained"
+    },
+    {
+      "source": "024057e4b37a9aa975a902e68c3609e7c43c40d1",
+      "commit": "03bfd2fb2308c78b7de8d52c232188e3883a8a4b",
+      "parents": [
+        "1f19ddc7dc25dc01efbe0d46199893192c1b2959"
+      ],
+      "title": "Perf: port Prefill Wo, RoPE, and Engram tuning to A3 graph",
+      "baseline": "1f19ddc7dc25dc01efbe0d46199893192c1b2959",
+      "changed_model_files": [
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/compressor.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/decode_indexer.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/engram.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/gemm.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/o_proj.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/prefill_indexer.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/prefill_swa.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/qkv_proj_rope.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/rope.py"
+      ],
+      "status": "retained"
+    },
+    {
+      "source": "bab86986104ad4d0fb1f10bda4967c109bcb3790",
+      "commit": "375810e0f11e13903e50b60815ccf47b84a2c565",
+      "parents": [
+        "e7d6062768a89163e1eeb3385325e2c7239e50b1",
+        "03bfd2fb2308c78b7de8d52c232188e3883a8a4b"
+      ],
+      "title": "Merge remote-tracking branch 'origin/deepseek_v4.1_flash_1122' into deepseek_v4.1_flash_1122",
+      "baseline": "e7d6062768a89163e1eeb3385325e2c7239e50b1",
+      "changed_model_files": [
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/compressor.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/decode_indexer.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/engram.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/gemm.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/o_proj.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/prefill_indexer.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/prefill_swa.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/qkv_proj_rope.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/rope.py"
+      ],
+      "status": "retained"
+    },
+    {
+      "source": "e73e13b42aa233c0661ddd5cf13054a4a7292002",
+      "commit": "4d0dbbc3a6ce99b709d3d14836a42b40764b64c8",
+      "parents": [
+        "375810e0f11e13903e50b60815ccf47b84a2c565"
+      ],
+      "title": "Test: add Decode fusion microbench harnesses",
+      "baseline": "375810e0f11e13903e50b60815ccf47b84a2c565",
+      "changed_model_files": [],
+      "status": "retained"
+    },
+    {
+      "source": "48a1b91d2b89449ac9bc163af92bb20045c08f8b",
+      "commit": "e48daefd4df711b1232719eaaa705490179fba07",
+      "parents": [
+        "4d0dbbc3a6ce99b709d3d14836a42b40764b64c8"
+      ],
+      "title": "Perf: tune Decode projection K tiles",
+      "baseline": "4d0dbbc3a6ce99b709d3d14836a42b40764b64c8",
+      "changed_model_files": [
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/qkv_proj_rope.py"
+      ],
+      "status": "retained",
+      "task": "deepseek-v4-1-flash-a3-decode-projection-k"
+    },
+    {
+      "source": "f4e5ea2a7eb1fcd1b003f587f17a75b67450f7d6",
+      "commit": "0b8c1a6ea37ce4db8b447683a8318929ebe8c7c8",
+      "parents": [
+        "e48daefd4df711b1232719eaaa705490179fba07"
+      ],
+      "title": "Perf: tune A3 prefill sparse attention",
+      "baseline": "e48daefd4df711b1232719eaaa705490179fba07",
+      "changed_model_files": [
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/sparse_attention.py"
+      ],
+      "status": "retained",
+      "task": "deepseek-v4-1-flash-a3-prefill-sparse-attention"
+    },
+    {
+      "source": "6371633072955fa5094e423a97f20e56fb1549fc",
+      "commit": "d6caf0f588cbd78941b58dca07324a8292c60518",
+      "parents": [
+        "0b8c1a6ea37ce4db8b447683a8318929ebe8c7c8"
+      ],
+      "title": "Perf: reduce small-batch MoE combine workers",
+      "baseline": "0b8c1a6ea37ce4db8b447683a8318929ebe8c7c8",
+      "changed_model_files": [
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/moe.py"
+      ],
+      "status": "retained"
+    },
+    {
+      "source": "038d297e4c128e7a90970170ac7b91e5a837f607",
+      "commit": "fa5dfb6404c73454dc4693a9c153bef539777a6c",
+      "parents": [
+        "d6caf0f588cbd78941b58dca07324a8292c60518"
+      ],
+      "title": "Perf: optimize DeepSeek V4.1 A3 prefill memory movement",
+      "baseline": "d6caf0f588cbd78941b58dca07324a8292c60518",
+      "changed_model_files": [
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/compressor.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/decode_c1a_full.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/decode_c1a_reindex.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/decode_c1a_reuse.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/decode_c2a_full.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/decode_c2a_reuse.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/decode_fwd.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/input_pack.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/moe.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/o_proj.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/prefill_cp_allgather.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/prefill_fwd.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/prefill_swa.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/sparse_attention.py"
+      ],
+      "status": "retained",
+      "task": "deepseek-v4-1-flash-a3-prefill-memory-movement"
+    },
+    {
+      "source": "1274027da5063c7a61df5391acb95d4e9c72e344",
+      "commit": "120f3a0f5cfd9892a398a4a6994fd724a6af3fbe",
+      "parents": [
+        "fa5dfb6404c73454dc4693a9c153bef539777a6c"
+      ],
+      "title": "Perf: tune DeepSeek V4.1 A3 prefill GEMM projections",
+      "baseline": "fa5dfb6404c73454dc4693a9c153bef539777a6c",
+      "changed_model_files": [
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/engram.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/gemm.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/prefill_fwd.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/qkv_proj_rope.py"
+      ],
+      "status": "retained",
+      "task": "deepseek-v4-1-flash-a3-prefill-gemm"
+    },
+    {
+      "source": "295d5e65d3206609e98499bb04e779472832ae6b",
+      "commit": "0154cd474f43d8dcebfe56411f93dcc64b945a2e",
+      "parents": [
+        "120f3a0f5cfd9892a398a4a6994fd724a6af3fbe"
+      ],
+      "title": "Perf: optimize DeepSeek V4.1 A3 Prefill vector kernels",
+      "baseline": "120f3a0f5cfd9892a398a4a6994fd724a6af3fbe",
+      "changed_model_files": [
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/activation_quant.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/decode_fwd.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/decode_indexer.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/expert_routed.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/expert_shared.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/gemm.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/moe.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/prefill_c1a_full.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/prefill_c1a_reindex.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/prefill_c1a_reuse.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/prefill_c2a_full.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/prefill_c2a_reuse.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/prefill_fwd.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/prefill_indexer.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/prefill_swa.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/qkv_proj_rope.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/quant.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/rmsnorm.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/rope.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/sparse_attention.py"
+      ],
+      "status": "retained",
+      "task": "deepseek-v4-1-flash-a3-prefill-vector"
+    },
+    {
+      "source": "8ad5781d6378bcde455493b0303148e0ea580492",
+      "commit": "59bf9b8de6f1621f1e8a129a0a3d64669cffadda",
+      "parents": [
+        "0154cd474f43d8dcebfe56411f93dcc64b945a2e"
+      ],
+      "title": "Perf: fuse Decode Q-B RoPE store",
+      "baseline": "0154cd474f43d8dcebfe56411f93dcc64b945a2e",
+      "changed_model_files": [
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/gemm.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/qkv_proj_rope.py"
+      ],
+      "status": "retained"
+    },
+    {
+      "source": "9975aa28aef2bf225f0e4f095db4a313176aac0e",
+      "commit": "7dea2f421421216f05c6b0b038ed0d11dc697b84",
+      "parents": [
+        "59bf9b8de6f1621f1e8a129a0a3d64669cffadda"
+      ],
+      "title": "Perf: split Decode RoPE stores",
+      "baseline": "59bf9b8de6f1621f1e8a129a0a3d64669cffadda",
+      "changed_model_files": [
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/gemm.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/qkv_proj_rope.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/rope.py"
+      ],
+      "status": "retained",
+      "task": "deepseek-v4-1-flash-a3-decode-rope-stores"
+    },
+    {
+      "source": "1753c6f8b1e4d0e5268aa1a5cf7e2684f97a7163",
+      "commit": "7d6e410c337892b028372bfc7fa6df6e2570da66",
+      "parents": [
+        "7dea2f421421216f05c6b0b038ed0d11dc697b84"
+      ],
+      "title": "Perf: optimize A3 prefill MoE routing panels",
+      "baseline": "7dea2f421421216f05c6b0b038ed0d11dc697b84",
+      "changed_model_files": [
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/gate.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/moe.py"
+      ],
+      "status": "retained",
+      "task": "deepseek-v4-1-flash-a3-prefill-moe-panels"
+    },
+    {
+      "source": "3604caa36fe743c699e8c997a0d9081161ba2e83",
+      "commit": "da9b4ab61ae439b1277b8a37942ef3d38594debf",
+      "parents": [
+        "7d6e410c337892b028372bfc7fa6df6e2570da66"
+      ],
+      "title": "Perf: accelerate A3 Prefill Engram unrotation",
+      "baseline": "7d6e410c337892b028372bfc7fa6df6e2570da66",
+      "changed_model_files": [
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/engram.py"
+      ],
+      "status": "retained",
+      "task": "deepseek-v4-1-flash-a3-prefill-engram"
+    },
+    {
+      "source": "fd6c856d983f520c6c131c3af49c5375d2b6c385",
+      "commit": "22281c2804663f3760f99a320a0988b1294a6c80",
+      "parents": [
+        "da9b4ab61ae439b1277b8a37942ef3d38594debf"
+      ],
+      "title": "Perf: optimize A3 prefill mHC kernels",
+      "baseline": "da9b4ab61ae439b1277b8a37942ef3d38594debf",
+      "changed_model_files": [
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/decode_c1a_full.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/decode_c1a_reindex.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/decode_c1a_reuse.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/decode_c2a_full.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/decode_c2a_reuse.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/decode_fwd.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/decode_swa.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/hc.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/moe.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/prefill_c1a_full.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/prefill_c1a_reindex.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/prefill_c1a_reuse.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/prefill_c2a_full.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/prefill_c2a_reuse.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/prefill_fwd.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/prefill_swa.py"
+      ],
+      "status": "retained",
+      "task": "deepseek-v4-1-flash-a3-prefill-mhc"
+    },
+    {
+      "source": "5c153593abec6ca0d6c6fa253495d2d3e5257d3e",
+      "commit": "2ae6005793a9b3ed5485c48a0b87049816af4bd9",
+      "parents": [
+        "22281c2804663f3760f99a320a0988b1294a6c80"
+      ],
+      "title": "Perf: add A3 prefill expert GEMM tuning to 1122",
+      "baseline": "22281c2804663f3760f99a320a0988b1294a6c80",
+      "changed_model_files": [
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/expert_routed.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/expert_shared.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/gemm.py"
+      ],
+      "status": "retained",
+      "task": "deepseek-v4-1-flash-a3-prefill-expert-gemm"
+    },
+    {
+      "source": "b60a1c7d4604a488f0b7b6575efc4bfbce32b23f",
+      "commit": "c74d9bc70c8d6c415ae00c1e710813d558dfc1f2",
+      "parents": [
+        "2ae6005793a9b3ed5485c48a0b87049816af4bd9"
+      ],
+      "title": "Fix decode gate padding for capacity 16",
+      "baseline": "2ae6005793a9b3ed5485c48a0b87049816af4bd9",
+      "changed_model_files": [
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/gate.py"
+      ],
+      "status": "retained"
+    },
+    {
+      "source": "79dd5d775eaab9c2a02fb6e0d81c6679905bfa0d",
+      "commit": "9c05078de6ec94318a8e80863012f9ac96d53236",
+      "parents": [
+        "c74d9bc70c8d6c415ae00c1e710813d558dfc1f2"
+      ],
+      "title": "Perf: accelerate A3 prefill Indexer",
+      "baseline": "c74d9bc70c8d6c415ae00c1e710813d558dfc1f2",
+      "changed_model_files": [
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/prefill_indexer.py"
+      ],
+      "status": "retained",
+      "task": "deepseek-v4-1-flash-a3-prefill-indexer"
+    },
+    {
+      "source": "640df027b31928c0fedf24a5e54d85bb5681d681",
+      "commit": "d572e5b3384069ec1e34e1045328b4744843302d",
+      "parents": [
+        "9c05078de6ec94318a8e80863012f9ac96d53236"
+      ],
+      "title": "Perf: split A3 mHC Decode kernels",
+      "baseline": "9c05078de6ec94318a8e80863012f9ac96d53236",
+      "changed_model_files": [
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/decode_c1a_full.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/decode_c1a_reindex.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/decode_c1a_reuse.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/decode_c2a_full.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/decode_c2a_reuse.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/decode_swa.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/hc.py"
+      ],
+      "status": "retained",
+      "task": "deepseek-v4-1-flash-a3-decode-mhc-split"
+    },
+    {
+      "source": "b1f59bc14f3ea14a722604f6b733cdf7b01d9f55",
+      "commit": "bdd156be83b95421c4012249e7194697861afe5e",
+      "parents": [
+        "d572e5b3384069ec1e34e1045328b4744843302d"
+      ],
+      "title": "Perf: optimize A3 prefill Indexer scoring and Query FP4",
+      "baseline": "d572e5b3384069ec1e34e1045328b4744843302d",
+      "changed_model_files": [
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/prefill_indexer.py"
+      ],
+      "status": "retained",
+      "task": "deepseek-v4-1-flash-a3-prefill-indexer-fp4"
+    },
+    {
+      "source": "2d8870be960cdef96420ff058dbc44fac2dd7344",
+      "commit": "226fcbdaad6ee9886658c30df20e0f72a148bc02",
+      "parents": [
+        "bdd156be83b95421c4012249e7194697861afe5e"
+      ],
+      "title": "Perf: fuse Decode MoE metadata wait",
+      "baseline": "bdd156be83b95421c4012249e7194697861afe5e",
+      "changed_model_files": [
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/moe.py"
+      ],
+      "status": "reverted"
+    },
+    {
+      "source": "a7fb2ae0f50911624c4d73f69edc1b4fc2a55bc2",
+      "commit": "a6cbcc87aec7c7c8215feec6268260c276e6a73f",
+      "parents": [
+        "226fcbdaad6ee9886658c30df20e0f72a148bc02"
+      ],
+      "title": "Revert \"Perf: fuse Decode MoE metadata wait\"",
+      "baseline": "226fcbdaad6ee9886658c30df20e0f72a148bc02",
+      "changed_model_files": [
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/moe.py"
+      ],
+      "status": "revert"
+    },
+    {
+      "source": "92d2f0434f064685fc510d810f1989a1c5e73f5c",
+      "commit": "77e120b14f358a525a46e096b5b9f5d86f14735a",
+      "parents": [
+        "a6cbcc87aec7c7c8215feec6268260c276e6a73f"
+      ],
+      "title": "Fix: restore high-precision Prefill mHC rsqrt",
+      "baseline": "a6cbcc87aec7c7c8215feec6268260c276e6a73f",
+      "changed_model_files": [
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/hc.py"
+      ],
+      "status": "retained"
+    },
+    {
+      "source": "cda40fd5e0100b94c05057b0ef23833245080e47",
+      "commit": "6874e02c6547c0af61ae137e1ed8161d6cde4140",
+      "parents": [
+        "77e120b14f358a525a46e096b5b9f5d86f14735a"
+      ],
+      "title": "Perf: reduce A3 Prefill mHC data movement",
+      "baseline": "77e120b14f358a525a46e096b5b9f5d86f14735a",
+      "changed_model_files": [
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/hc.py"
+      ],
+      "status": "retained"
+    },
+    {
+      "source": "60189223bb6e99817cba30b2cf0cecf503975c31",
+      "commit": "51be40cd299afca5c0373f7b46fb8d8df1600527",
+      "parents": [
+        "6874e02c6547c0af61ae137e1ed8161d6cde4140"
+      ],
+      "title": "Perf: widen Decode mHC Post fusion",
+      "baseline": "6874e02c6547c0af61ae137e1ed8161d6cde4140",
+      "changed_model_files": [
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/hc.py"
+      ],
+      "status": "retained"
+    },
+    {
+      "source": "eaf4417707c494d815db6b559404775a07fc849c",
+      "commit": "335d58bf0b3265b45ed361a2fc876fdec686dd5b",
+      "parents": [
+        "51be40cd299afca5c0373f7b46fb8d8df1600527"
+      ],
+      "title": "Perf: adapt Decode mHC Post fusion by token count",
+      "baseline": "51be40cd299afca5c0373f7b46fb8d8df1600527",
+      "changed_model_files": [
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/hc.py"
+      ],
+      "status": "reverted"
+    },
+    {
+      "source": "050440d7ba96cccac82782185178b907523ac61e",
+      "commit": "30ff61cde66952976184594e6d3f21f644953d56",
+      "parents": [
+        "335d58bf0b3265b45ed361a2fc876fdec686dd5b"
+      ],
+      "title": "Revert \"Perf: adapt Decode mHC Post fusion by token count\"",
+      "baseline": "335d58bf0b3265b45ed361a2fc876fdec686dd5b",
+      "changed_model_files": [
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/hc.py"
+      ],
+      "status": "revert"
+    },
+    {
+      "source": "c0d185715e662d11c9565d776e0091ee3f232571",
+      "commit": "78503a986b7d107a022ae7fc58de317017df4536",
+      "parents": [
+        "30ff61cde66952976184594e6d3f21f644953d56"
+      ],
+      "title": "Perf: use Cube attention for SWA windows",
+      "baseline": "30ff61cde66952976184594e6d3f21f644953d56",
+      "changed_model_files": [
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/sparse_attention.py"
+      ],
+      "status": "retained",
+      "task": "deepseek-v4-1-flash-a3-swa-cube"
+    },
+    {
+      "source": "0c175caf2f94a3e5c376c6f5168835604b39ea58",
+      "commit": "1b00b9454cb0214ba9942bdff8eb37673fc1e487",
+      "parents": [
+        "78503a986b7d107a022ae7fc58de317017df4536"
+      ],
+      "title": "Perf: pack Prefill mHC Sinkhorn reductions",
+      "baseline": "78503a986b7d107a022ae7fc58de317017df4536",
+      "changed_model_files": [
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/hc.py"
+      ],
+      "status": "retained",
+      "task": "deepseek-v4-1-flash-a3-prefill-mhc-sinkhorn"
+    },
+    {
+      "source": "8e86521c512a9e473b30e34fdecd2505b5baed69",
+      "commit": "fd4620b9eb433c0ecfb24871f2b5f22847218cc5",
+      "parents": [
+        "1b00b9454cb0214ba9942bdff8eb37673fc1e487"
+      ],
+      "title": "Perf: streamline A3 Prefill normalization and RoPE",
+      "baseline": "1b00b9454cb0214ba9942bdff8eb37673fc1e487",
+      "changed_model_files": [
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/activation_quant.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/moe.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/o_proj.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/quant.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/rmsnorm.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/sparse_attention.py"
+      ],
+      "status": "retained"
+    },
+    {
+      "source": "4f87af0d59a8046102e186b89d4b210b061aee2f",
+      "commit": "a6a3ba7d8f5651722b9cb45e31cc9c7bea93307c",
+      "parents": [
+        "fd4620b9eb433c0ecfb24871f2b5f22847218cc5"
+      ],
+      "title": "Perf: tune A3 Decode mHC Post tiles by slab size",
+      "baseline": "fd4620b9eb433c0ecfb24871f2b5f22847218cc5",
+      "changed_model_files": [
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/hc.py"
+      ],
+      "status": "retained",
+      "task": "deepseek-v4-1-flash-a3-decode-mhc-post"
+    },
+    {
+      "source": "38c77a9817090609d74728f24bccea9fb1a682ac",
+      "commit": "2bd279d470e3d061fadd75a72aad2bb52ce83571",
+      "parents": [
+        "a6a3ba7d8f5651722b9cb45e31cc9c7bea93307c"
+      ],
+      "title": "Perf: optimize A3 prefill MoE routing",
+      "baseline": "a6a3ba7d8f5651722b9cb45e31cc9c7bea93307c",
+      "changed_model_files": [
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/gate.py",
+        "pypto-serving-deepseek-v4.1-flash-a3/models/deepseek_v4_1_flash_a3/moe.py"
+      ],
+      "status": "retained",
+      "task": "deepseek-v4-1-flash-a3-prefill-moe-routing"
+    }
+  ]
+}

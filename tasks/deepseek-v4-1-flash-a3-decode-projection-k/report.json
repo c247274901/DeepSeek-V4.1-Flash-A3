@@ -1,0 +1,24 @@
+{
+  "schema": 1,
+  "type": "kernel",
+  "name": "Decode projection K tiles",
+  "goal": "Replay a single live Decode token with fixed W8A8 scales.",
+  "config": {
+    "Baseline": "4d0dbbc3a6ce99b709d3d14836a42b40764b64c8",
+    "Candidate": "e48daefd4df711b1232719eaaa705490179fba07",
+    "Upstream baseline": "e73e13b42aa233c0661ddd5cf13054a4a7292002",
+    "Upstream candidate": "48a1b91d2b89449ac9bc163af92bb20045c08f8b",
+    "Workload": "A3 W8A8 · 8K Prefill · 8 output · batch 1",
+    "Timing": "synchronous_full_entry_us"
+  },
+  "metrics": [
+    {
+      "key": "worst_baseline_ratio",
+      "label": "Worst candidate / baseline latency ratio",
+      "unit": "x",
+      "direction": "lower",
+      "decimals": 3,
+      "description": "Largest paired ratio over the named latency cases after correctness checks."
+    }
+  ]
+}

@@ -1,0 +1,24 @@
+{
+  "schema": 1,
+  "type": "kernel",
+  "name": "SWA window attention on Cube",
+  "goal": "Compare the SWA implementations with identical window positions, head layout and output.",
+  "config": {
+    "Baseline": "30ff61cde66952976184594e6d3f21f644953d56",
+    "Candidate": "78503a986b7d107a022ae7fc58de317017df4536",
+    "Upstream baseline": "050440d7ba96cccac82782185178b907523ac61e",
+    "Upstream candidate": "c0d185715e662d11c9565d776e0091ee3f232571",
+    "Workload": "A3 W8A8 · 8K Prefill · 8 output · batch 1",
+    "Timing": "synchronous_full_entry_us"
+  },
+  "metrics": [
+    {
+      "key": "worst_baseline_ratio",
+      "label": "Worst candidate / baseline latency ratio",
+      "unit": "x",
+      "direction": "lower",
+      "decimals": 3,
+      "description": "Largest paired ratio over the named latency cases after correctness checks."
+    }
+  ]
+}

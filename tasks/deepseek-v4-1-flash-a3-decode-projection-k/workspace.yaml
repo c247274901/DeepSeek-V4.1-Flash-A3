@@ -1,0 +1,20 @@
+schema: 2
+modules:
+  - id: artifact-baseline
+    path: modules/artifact-baseline
+    source: https://github.com/c247274901/DeepSeek-V4.1-Flash-A3.git
+    revision: 4d0dbbc3a6ce99b709d3d14836a42b40764b64c8
+    policy: locked
+    install: "none"
+  - id: artifact-candidate
+    path: modules/artifact-candidate
+    source: https://github.com/c247274901/DeepSeek-V4.1-Flash-A3.git
+    revision: e48daefd4df711b1232719eaaa705490179fba07
+    policy: locked
+    install: "none"
+  - id: artifact-harness
+    path: modules/artifact-harness
+    source: https://github.com/c247274901/DeepSeek-V4.1-Flash-A3.git
+    revision: 3ed6a6e56e7df5d5ec470660d50dbfad82942437
+    policy: locked
+    install: "none"

@@ -1,0 +1,24 @@
+{
+  "schema": 1,
+  "type": "kernel",
+  "name": "Prefill Indexer scoring and Query FP4",
+  "goal": "Check score output, top-k and the packed query representation.",
+  "config": {
+    "Baseline": "d572e5b3384069ec1e34e1045328b4744843302d",
+    "Candidate": "bdd156be83b95421c4012249e7194697861afe5e",
+    "Upstream baseline": "640df027b31928c0fedf24a5e54d85bb5681d681",
+    "Upstream candidate": "b1f59bc14f3ea14a722604f6b733cdf7b01d9f55",
+    "Workload": "A3 W8A8 · 8K Prefill · 8 output · batch 1",
+    "Timing": "synchronous_full_entry_us"
+  },
+  "metrics": [
+    {
+      "key": "worst_baseline_ratio",
+      "label": "Worst candidate / baseline latency ratio",
+      "unit": "x",
+      "direction": "lower",
+      "decimals": 3,
+      "description": "Largest paired ratio over the named latency cases after correctness checks."
+    }
+  ]
+}
