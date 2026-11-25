@@ -150,15 +150,12 @@ def _quantize_prefill_rows(
             raw = pl.load(source, [row, 0], [VEC_M_TILE, width], valid_shape=[valid, width])
             padded = pl.fillpad(raw, pad_value=pl.PadValue.zero)
             cached = pl.set_validshape(padded, VEC_M_TILE, width)
-            if panel_width == width:
-                peak_bits = pl.ands(pl.reinterpret_view(cached, pl.INT16), 32767)
-            else:
-                peak_bits = pl.tile.full([VEC_M_TILE, panel_width], dtype=pl.INT16, value=0)
-                for col in pl.range(0, width, panel_width):
-                    panel = pl.tile.slice(cached, [VEC_M_TILE, panel_width], [0, col])
-                    panel_bits = pl.reinterpret_view(panel, pl.INT16)
-                    magnitude_bits = pl.ands(panel_bits, 32767)
-                    peak_bits = pl.maximum(peak_bits, magnitude_bits)
+            peak_bits = pl.tile.full([VEC_M_TILE, panel_width], dtype=pl.INT16, value=0)
+            for col in pl.range(0, width, panel_width):
+                panel = pl.tile.slice(cached, [VEC_M_TILE, panel_width], [0, col])
+                panel_bits = pl.reinterpret_view(panel, pl.INT16)
+                magnitude_bits = pl.ands(panel_bits, 32767)
+                peak_bits = pl.maximum(peak_bits, magnitude_bits)
             peak_bf16 = pl.reinterpret_view(peak_bits, pl.BF16)
             peak = pl.cast(peak_bf16, pl.FP32)
             scratch = pl.create_tile([VEC_M_TILE, panel_width], dtype=pl.FP32)

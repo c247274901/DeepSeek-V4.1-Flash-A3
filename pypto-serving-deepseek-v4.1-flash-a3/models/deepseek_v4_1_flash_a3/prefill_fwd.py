@@ -70,6 +70,7 @@ from .engram import ENGRAM_K, KV_OUT, prefill_engram_from_rows
 from .lm_head import GROUP_LOGIT_ROWS, final_output
 from .moe import ROUTED_RECV_ROWS, prefill_moe_sublayer, prefill_ffn_restore
 from .moe import AUX_WIDTH, SIGNAL_PAD, clear_moe_signals
+from .moe import prepare_prefill_routes
 from .compressor import STATE_WIDTH
 from .prefill_c1a_full import prefill_publish_decoder
 from .prefill_swa import prefill_swa_attention
@@ -324,6 +325,8 @@ def _prefill_moe(
     slab_mixed: pl.Tensor[[MOE_TOKENS * TP_SIZE, D], pl.BF16],
     statistics: pl.Tensor[[MOE_ROUNDS, 3], pl.INT32],
     gate_inputs: pl.Tensor[[LOCAL_MOE_ROWS, D], pl.BF16],
+    owner_payload: pl.Tensor[[LOCAL_MOE_ROWS, D], pl.INT8],
+    owner_scales: pl.Tensor[[LOCAL_MOE_ROWS, 1], pl.FP32],
     gate_indices: pl.Tensor[[LOCAL_MOE_ROWS, TOPK], pl.INT32],
     gate_weights: pl.Tensor[[LOCAL_MOE_ROWS, TOPK], pl.FP32],
     reuse_ready: pl.Scalar[pl.TASK_ID],
@@ -351,6 +354,12 @@ def _prefill_moe(
     )
     round_tokens = MOE_TOKENS * TP_SIZE
     rounds = (CAPACITY + round_tokens - 1) // round_tokens
+    with pl.scope():
+        prepare_prefill_routes(
+            prefill_ffn_input, norm_weight, gate_weight, correction_bias,
+            gate_inputs, owner_payload, owner_scales, gate_indices, gate_weights,
+            num_tokens, ep_rank % TP_SIZE, LOCAL_MOE_ROWS,
+        )
     completion = pl.array.create(1, pl.TASK_ID)
     # Keep the slab pipeline independent from the layer-wide pre transform.
     # Consumers of the sliced precomputed buffers carry the data dependency,
@@ -388,6 +397,9 @@ def _prefill_moe(
             local_gate_inputs = pl.slice(gate_inputs, [MOE_TOKENS, D], [route_offset, 0])
             local_gate_indices = pl.slice(gate_indices, [MOE_TOKENS, TOPK], [route_offset, 0])
             local_gate_weights = pl.slice(gate_weights, [MOE_TOKENS, TOPK], [route_offset, 0])
+            local_payload = pl.slice(owner_payload, [MOE_TOKENS, D], [route_offset, 0])
+            scale_rows = owner_scales[route_offset : route_offset + MOE_TOKENS, :]
+            local_scales = pl.reshape(scale_rows, [1, MOE_TOKENS])
             owned_result, round_counts = prefill_moe_sublayer(
                 round_hidden, round_pre, hc_ffn_fn, hc_ffn_scale, hc_ffn_base, norm_weight,
                 gate_weight, correction_bias,
@@ -396,7 +408,7 @@ def _prefill_moe(
                 recv_meta, recv_x, recv_weights, arrived, data_arrived,
                 routed_output, combine_arrived, ffn_input, owned, round_next, post, residual,
                 local_gate_inputs, local_gate_indices, local_gate_weights,
-                active, ep_rank, ep_rank % TP_SIZE, epoch, completion, True, True,
+                active, ep_rank, ep_rank % TP_SIZE, epoch, completion, True, True, local_payload, local_scales, pl.const(0, pl.INDEX),
             )
             with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_moe_counts"):
                 for counter in pl.range(3):
@@ -594,6 +606,8 @@ def l2_prefill_fwd(
     slab_hidden = pl.create_tensor([MOE_TOKENS * TP_SIZE, HC_MULT, D], dtype=pl.FP32)
     slab_pre = pl.create_tensor([MOE_TOKENS * TP_SIZE, HC_MULT], dtype=pl.FP32)
     slab_mixed = pl.create_tensor([MOE_TOKENS * TP_SIZE, D], dtype=pl.BF16)
+    owner_payload = pl.create_tensor([LOCAL_MOE_ROWS, D], dtype=pl.INT8)
+    owner_scales = pl.create_tensor([LOCAL_MOE_ROWS, 1], dtype=pl.FP32)
     moe_ready = pl.system.task_dummy(deps=[])
     for layer in pl.range(first_layer, last_layer):
         stage = layer // 20
@@ -738,7 +752,7 @@ def l2_prefill_fwd(
             layer_shared_w3, layer_shared_w3_scale, next_pre, next_hidden,
             recv_meta, recv_x, recv_weights, arrived, data_arrived,
             routed_output, combine_arrived, slab_hidden, slab_pre, slab_mixed, moe_statistics[layer],
-            moe_gate_inputs, moe_route_indices[layer], moe_route_weights[layer],
+            moe_gate_inputs, owner_payload, owner_scales, moe_route_indices[layer], moe_route_weights[layer],
             moe_ready, active, rank, layer - first_layer + 1, ffn_window, ffn_arrived,
         )
     final_slot = (2 * ((last_layer - 1) // 20 - first_layer // 20) + (last_layer - first_layer) % 2) * CAPACITY
