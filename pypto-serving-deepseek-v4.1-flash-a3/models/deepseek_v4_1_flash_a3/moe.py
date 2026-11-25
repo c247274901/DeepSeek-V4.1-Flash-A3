@@ -23,9 +23,9 @@ from .expert_shared import expert_shared
 from .expert_routed import (
     expert_routed_scatter,
 )
-from .hc import hc_pre, hc_post
+from .hc import hc_ffn_decode_mixes, hc_pre, hc_post
 from .rmsnorm import prefill_ffn_norm_quant, rms_norm_tiled
-from .o_proj import prefill_tp_output_all_reduce
+from .o_proj import decode_tp_output_post_token, prefill_tp_output_all_reduce
 
 
 if EP_SIZE % TP_SIZE:
@@ -491,10 +491,19 @@ def prefill_moe_sublayer(
 ):
     """Collapse mHC streams, normalize compact TP owner rows, and run the EP MoE."""
     if not hc_precomputed:
-        hc_pre(
-            x_hc, pre_mix, hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
-            ffn_input, next_pre_mix, post_mix, residual_mix, prefill=prefill,
-        )
+        if prefill:
+            hc_pre(
+                x_hc, pre_mix, hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
+                ffn_input, next_pre_mix, post_mix, residual_mix, prefill=True,
+            )
+        elif num_tokens == 1:
+            hc_ffn_decode_mixes(
+                x_hc, hc_ffn_fn, hc_ffn_scale, hc_ffn_base, next_pre_mix, post_mix, residual_mix, one_token=True,
+            )
+        else:
+            hc_ffn_decode_mixes(
+                x_hc, hc_ffn_fn, hc_ffn_scale, hc_ffn_base, next_pre_mix, post_mix, residual_mix, one_token=False,
+            )
     local_num_tokens = _local_token_count(num_tokens, tp_rank)
     local_ffn_owned = pl.create_tensor([TOKENS, D], dtype=pl.BF16)
     round_counts = pl.create_tensor([3], dtype=pl.INT32)
@@ -619,12 +628,27 @@ def prefill_ffn_restore(
     prefill: pl.constexpr = False,
 ):
     """Sum TP routed partials and expand the residual stream with mHC."""
-    prefill_tp_output_all_reduce(
-        ffn_owned, ffn_window, ffn_arrived, ffn_output, group_base, tp_rank, num_tokens, ffn_epoch, owner_rows=True,
-    )
-    hc_post_deps = pl.array.create(2, pl.TASK_ID)
-    hc_post(
-        ffn_output, x_hc, post_mix, residual_mix, x_hc_out,
-        deps=hc_post_deps, prefill=prefill,
-    )
+    if prefill:
+        prefill_tp_output_all_reduce(
+            ffn_owned, ffn_window, ffn_arrived, ffn_output, group_base, tp_rank, num_tokens, ffn_epoch, owner_rows=True,
+        )
+        hc_post_deps = pl.array.create(2, pl.TASK_ID)
+        hc_post(
+            ffn_output, x_hc, post_mix, residual_mix, x_hc_out,
+            deps=hc_post_deps, prefill=prefill,
+        )
+    elif num_tokens == 1:
+        decode_tp_output_post_token(
+            ffn_owned, ffn_window, ffn_arrived, group_base, tp_rank, num_tokens, ffn_epoch,
+            x_hc, post_mix, residual_mix, post_mix, x_hc_out, ffn_output, True,
+        )
+    else:
+        prefill_tp_output_all_reduce(
+            ffn_owned, ffn_window, ffn_arrived, ffn_output, group_base, tp_rank, num_tokens, ffn_epoch, owner_rows=True,
+        )
+        hc_post_deps = pl.array.create(2, pl.TASK_ID)
+        hc_post(
+            ffn_output, x_hc, post_mix, residual_mix, x_hc_out,
+            deps=hc_post_deps, prefill=False,
+        )
     return x_hc_out
