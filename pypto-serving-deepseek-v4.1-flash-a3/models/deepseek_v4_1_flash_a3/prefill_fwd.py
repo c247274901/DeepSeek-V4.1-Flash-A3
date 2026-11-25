@@ -66,7 +66,7 @@ from .hc import hc_post
 from .hc import hc_head, hc_pre, zero_bf16_padding
 from .input_pack import HIDDEN_TILE, gather_rows, pack_x_hc, prepare_compressed_lens
 from .rope_tables import ROPE_ROWS_DYN, materialize_rope_rows
-from .engram import ENGRAM_K, KV_OUT, prefill_engram_from_rows
+from .engram import ENGRAM_K, ENGRAM_WKV_WIDTH, prefill_engram_from_rows
 from .lm_head import GROUP_LOGIT_ROWS, final_output
 from .moe import ROUTED_RECV_ROWS, prefill_moe_sublayer, prefill_ffn_restore
 from .moe import AUX_WIDTH, SIGNAL_PAD, clear_moe_signals
@@ -449,7 +449,7 @@ def _prefill_moe(
 def l2_prefill_fwd(
     embedding: pl.Tensor[[CAPACITY, D], pl.BF16],
     engram_lookup: pl.Tensor[[2, CAPACITY, ENGRAM_K], pl.BF16],
-    engram_wkv: pl.Tensor[[2, ENGRAM_K, KV_OUT], pl.BF16, pl.NZ],
+    engram_wkv: pl.Tensor[[ENGRAM_K, ENGRAM_WKV_WIDTH], pl.BF16, pl.NZ],
     engram_weight: pl.Tensor[[2, HC_MULT, D], pl.FP32],
     engram_rotation: pl.Tensor[[D // 32, 32, 32], pl.FP32],
     embedding_ids: pl.Tensor[[CAPACITY], pl.INT64],
@@ -692,11 +692,15 @@ def l2_prefill_fwd(
                 gather_rows(encoder_pre, replay_rows, delayed_pre, publisher_ready, HIDDEN_TILE)
         # Empty source rounds consume zeros. Materialize the observable attention output on the final layer.
         if active > 0 or layer + 1 == last_layer:
-            if layer == 1 or layer == 14:
+            if layer == 1:
                 with pl.scope():
-                    engram_slot = layer // 14
                     prefill_engram_from_rows(
-                        engram_lookup[engram_slot], engram_wkv[engram_slot], engram_weight[engram_slot], engram_rotation, hidden, hidden,
+                        engram_lookup[0], engram_wkv, engram_weight[0], engram_rotation, hidden, hidden, 0,
+                    )
+            elif layer == 14:
+                with pl.scope():
+                    prefill_engram_from_rows(
+                        engram_lookup[1], engram_wkv, engram_weight[1], engram_rotation, hidden, hidden, 1,
                     )
             with pl.scope():
                 attn_post = pl.create_tensor([CAPACITY, HC_MULT], dtype=pl.FP32)
@@ -780,7 +784,7 @@ def l2_prefill_fwd(
 def l3_prefill_fwd(
     embedding: pl.Tensor[[RANKS, CAPACITY, D], pl.BF16],
     engram_lookup: pl.Tensor[[RANKS, 2, CAPACITY, ENGRAM_K], pl.BF16],
-    engram_wkv: pl.Tensor[[RANKS, 2, ENGRAM_K, KV_OUT], pl.BF16, pl.NZ],
+    engram_wkv: pl.Tensor[[RANKS, ENGRAM_K, ENGRAM_WKV_WIDTH], pl.BF16, pl.NZ],
     engram_weight: pl.Tensor[[RANKS, 2, HC_MULT, D], pl.FP32],
     engram_rotation: pl.Tensor[[RANKS, D // 32, 32, 32], pl.FP32],
     embedding_ids: pl.Tensor[[RANKS, CAPACITY], pl.INT64],

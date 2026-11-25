@@ -25,11 +25,12 @@ from tokenizers import Tokenizer
 from pypto.backend import BackendType
 from pypto.ir import DistributedConfig
 from pypto.ir.distributed_compiled_program import DistributedCompiledProgram
-from pypto.runtime import DeviceTensor, ExecutionMode, RunConfig, StackedDeviceTensor
+from pypto.runtime import DeviceTensor, ExecutionMode, RunConfig
 from pypto.runtime.distributed_runner import DistributedWorker
 
 from . import config as C
 from .config import FLASH as M
+from .device_views import stack_rank_tensor
 from .engram import HostEngram
 from .host import prepare_resident_inputs
 from .utils import DECODE_CACHE_NAMES, decode_cache_views, prepare_decode_inputs
@@ -313,8 +314,7 @@ def open_resident_graphs(args, devices, weights, engram, memory, report, *, sele
             )
             arguments = []
             for index in range(2):
-                stacked = {name: StackedDeviceTensor([rank[name] for rank in ranks[index]],
-                           (16, *ranks[index][0][name].shape), tuple(range(16)))
+                stacked = {name: stack_rank_tensor(name, [rank[name] for rank in ranks[index]])
                            for name in names[index] if name not in counts}
                 stacked.update(counts if index == 1 else {})
                 arguments.append(stacked)

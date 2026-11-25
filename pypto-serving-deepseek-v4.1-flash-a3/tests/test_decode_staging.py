@@ -8,6 +8,7 @@
 # -----------------------------------------------------------------------------------------------------------
 """Check that single-token staging preserves the resident Decode ABI."""
 
+from importlib import import_module
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -15,11 +16,59 @@ import pytest
 import torch
 
 from models.deepseek_v4_1_flash_a3.host import prepare_prefill_inputs, prepare_resident_inputs
-from models.deepseek_v4_1_flash_a3.config import FLASH
-from models.deepseek_v4_1_flash_a3.device_views import _device_view
+from models.deepseek_v4_1_flash_a3.config import EP_SIZE, FLASH
+from models.deepseek_v4_1_flash_a3.device_views import _device_view, stack_rank_tensor
 from models.deepseek_v4_1_flash_a3.engram import ENGRAM_K
 from models.deepseek_v4_1_flash_a3.utils import DECODE_CACHE_NAMES, prepare_decode_inputs
 from models.deepseek_v4_1_flash_a3.replay import DecodeInputs
+
+
+@pytest.mark.parametrize(("phase", "capacity"), [("prefill", 8192), ("decode", 16)])
+def test_engram_compile_spec_keeps_the_resident_rank_axis(phase, capacity):
+    from models.deepseek_v4_1_flash_a3.driver import build_specs
+    from models.deepseek_v4_1_flash_a3.weights import forward_weight_layouts
+    from pypto.ir.compiled_program import _validate_stacked_tensor
+    from pypto.ir.param_info import _param_info_from_dict
+    from pypto.runtime import DeviceTensor
+
+    module = import_module(f"models.deepseek_v4_1_flash_a3.{phase}_fwd")
+    forward = getattr(module, f"l3_{phase}_fwd")
+    spec = next(
+        spec for spec in build_specs(forward, mode=phase, capacity=capacity)
+        if spec.name == "engram_wkv"
+    )
+    rank_shape, dtype = forward_weight_layouts()["engram_wkv"]
+    assert spec.shape == [EP_SIZE, 3200, 384, 16, 16]
+    assert spec.dtype == dtype
+    shards = [DeviceTensor(0x1000, rank_shape, dtype) for _ in range(EP_SIZE)]
+    param = _param_info_from_dict({
+        "name": spec.name, "direction": "In", "shape": spec.shape,
+        "dtype": "bfloat16", "layout": "NZ",
+    })
+    _validate_stacked_tensor(stack_rank_tensor(spec.name, shards), param)
+
+
+def test_engram_single_rank_nz_slice_keeps_its_allocation():
+    from pypto.runtime import DeviceTensor
+
+    shape = (32, 48)
+    blocks = (3, 2, 16, 16)
+    buffers = [
+        SimpleNamespace(base=base, nbytes=4096, tensor=Mock())
+        for base in (0x1000, 0x2000)
+    ]
+    shards = [
+        DeviceTensor(buffer.base + 32, shape, torch.bfloat16, buffer=buffer, byte_offset=32)
+        for buffer in buffers
+    ]
+    engram = stack_rank_tensor("engram_wkv", shards)
+    view = engram[1:2, 0:3, 0:2, 0:16, 0:16]
+    assert view.shape == (1, *blocks)
+    assert view.buffer is buffers[1]
+    assert view.data_ptr == shards[1].data_ptr
+    assert view.byte_offset == 32
+    with pytest.raises(ValueError, match="whole-shard"):
+        engram[1:2, 0:2]
 
 
 @pytest.mark.parametrize("capacity", [16, 80])

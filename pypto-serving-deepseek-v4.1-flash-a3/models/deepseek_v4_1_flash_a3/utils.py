@@ -15,6 +15,7 @@ import torch
 
 from . import config as C
 from .config import BLOCK_SIZE, FLASH as M, TP_SIZE
+from .device_views import stack_rank_tensor
 from golden import ScalarSpec
 
 
@@ -139,7 +140,6 @@ def window_metadata(
 def upload_forward_inputs(runtime, specs, parameters, ranks, host_inputs, upload_buffer):
     """Upload rank-local storage through a shared buffer registered before runtime preparation."""
     from pypto.ir import ParamDirection
-    from pypto.runtime import StackedDeviceTensor
 
     chunk_bytes = upload_buffer.numel()
     arguments = []
@@ -153,6 +153,11 @@ def upload_forward_inputs(runtime, specs, parameters, ranks, host_inputs, upload
         shape = spec.shape[1:]
         if spec.shape[0] != ranks:
             raise ValueError(f"{spec.name} needs a leading rank axis of size {ranks}")
+        if spec.name == "engram_wkv":
+            # Keep the initializer bytes in NZ order. The runtime validator
+            # expects the resident handle to declare the logical matrix shape.
+            column_blocks, row_blocks, tile_rows, tile_columns = shape
+            shape = (row_blocks * tile_rows, column_blocks * tile_columns)
         shards = []
         for rank in range(ranks):
             handle = runtime.alloc_tensor(shape, spec.dtype, worker_id=rank)
@@ -177,7 +182,7 @@ def upload_forward_inputs(runtime, specs, parameters, ranks, host_inputs, upload
                 if tensor_value:
                     upload_buffer[:size].copy_(value[offset:offset + size])
                 runtime.copy_to(handle.data_ptr, upload_buffer.data_ptr(), size, dst_offset=offset, worker_id=rank)
-        arguments.append(StackedDeviceTensor(shards, tuple(spec.shape), tuple(range(ranks))))
+        arguments.append(stack_rank_tensor(spec.name, shards))
     return arguments
 
 

@@ -55,7 +55,7 @@ from .decode_swa import decode_swa
 from .input_pack import prepare_compressed_lens
 from .lm_head import GROUP_LOGIT_ROWS, MAX_LOGIT_ROWS, SAMPLED_IDS_PAD, VOCAB, VOCAB_PER_TP, final_output
 from .rope_tables import ROPE_ROWS_DYN, materialize_rope_rows
-from .engram import ENGRAM_K, KV_OUT, engram_from_rows
+from .engram import ENGRAM_K, ENGRAM_WKV_WIDTH, engram_from_rows
 from .moe import (
     SIGNAL_PAD, clear_moe_signals, AUX_WIDTH, EP_SIZE, N_LOCAL_EXPERTS,
 )
@@ -122,7 +122,7 @@ def _moe_source_mask(moe_num_tokens: pl.Tensor[[EP_SIZE], pl.INT32]):
 @pl.jit.inline(auto_scope=False)
 def decode_encoder(
     engram_lookup: pl.Tensor[[2, LOCAL_T_DYN, ENGRAM_K], pl.BF16],
-    engram_wkv: pl.Tensor[[2, ENGRAM_K, KV_OUT], pl.BF16, pl.NZ],
+    engram_wkv: pl.Tensor[[ENGRAM_K, ENGRAM_WKV_WIDTH], pl.BF16, pl.NZ],
     engram_weight: pl.Tensor[[2, HC_MULT, D], pl.FP32],
     engram_rotation: pl.Tensor[[D // 32, 32, 32], pl.FP32],
     x_hc: pl.InOut[pl.Tensor[[LOCAL_T_DYN, HC_MULT, D], pl.FP32]],
@@ -275,11 +275,15 @@ def decode_encoder(
     selected_kv = pl.create_tensor([tokens, 128 + INDEX_TOPK, HEAD_DIM], dtype=pl.BF16)
     selected_indices = pl.create_tensor([tokens, 128 + INDEX_TOPK], dtype=pl.INT32)
     for layer in pl.range(0, 20):
-        if layer == 1 or layer == 14:
+        if layer == 1:
             with pl.scope():
-                engram_slot = layer // 14
                 engram_from_rows(
-                    engram_lookup[engram_slot], engram_wkv[engram_slot], engram_weight[engram_slot], engram_rotation, x_hc, x_hc,
+                    engram_lookup[0], engram_wkv, engram_weight[0], engram_rotation, x_hc, x_hc, 0,
+                )
+        elif layer == 14:
+            with pl.scope():
+                engram_from_rows(
+                    engram_lookup[1], engram_wkv, engram_weight[1], engram_rotation, x_hc, x_hc, 1,
                 )
         with pl.scope():
             layer_window_cache = pl.slice(window_cache_pool, [window_blocks_per_layer, BLOCK_SIZE, 1, HEAD_DIM], [layer * window_blocks_per_layer, 0, 0, 0])
@@ -606,7 +610,7 @@ def decode_decoder(
 @pl.jit(auto_scope=False)
 def l2_decode_fwd(
     engram_lookup: pl.Tensor[[2, LOCAL_T_DYN, ENGRAM_K], pl.BF16],
-    engram_wkv: pl.Tensor[[2, ENGRAM_K, KV_OUT], pl.BF16, pl.NZ],
+    engram_wkv: pl.Tensor[[ENGRAM_K, ENGRAM_WKV_WIDTH], pl.BF16, pl.NZ],
     engram_weight: pl.Tensor[[2, HC_MULT, D], pl.FP32],
     engram_rotation: pl.Tensor[[D // 32, 32, 32], pl.FP32],
     x_hc: pl.InOut[pl.Tensor[[LOCAL_T_DYN, HC_MULT, D], pl.FP32]],
@@ -729,7 +733,7 @@ def l2_decode_fwd(
 @pl.jit.host
 def l3_decode_fwd(
     engram_lookup: pl.Tensor[[EP_SIZE, 2, LOCAL_T_DYN, ENGRAM_K], pl.BF16],
-    engram_wkv: pl.Tensor[[EP_SIZE, 2, ENGRAM_K, KV_OUT], pl.BF16, pl.NZ],
+    engram_wkv: pl.Tensor[[EP_SIZE, ENGRAM_K, ENGRAM_WKV_WIDTH], pl.BF16, pl.NZ],
     engram_weight: pl.Tensor[[EP_SIZE, 2, HC_MULT, D], pl.FP32],
     engram_rotation: pl.Tensor[[EP_SIZE, D // 32, 32, 32], pl.FP32],
     x_hc: pl.InOut[pl.Tensor[[EP_SIZE, LOCAL_T_DYN, HC_MULT, D], pl.FP32]],

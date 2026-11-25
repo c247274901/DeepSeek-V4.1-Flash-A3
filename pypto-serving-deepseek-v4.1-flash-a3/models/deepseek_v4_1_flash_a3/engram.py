@@ -34,6 +34,7 @@ N_HASH_COLS = (M.engram_max_ngram_size - 1) * M.engram_n_heads  # 24
 HEAD_DIM = M.engram_head_dim  # 256
 ENGRAM_K = N_HASH_COLS * HEAD_DIM  # 6144 flattened lookup width
 KV_OUT = (HC_MULT + 1) * D  # 5 * 5120 = 25600
+ENGRAM_WKV_WIDTH = len(M.engram_layer_ids) * KV_OUT
 # Validation-sized table; the released layer-1 table (384006168 rows) does not fit
 # in host memory for a standalone case, so this exercises the same kernel against a
 # much smaller row count. The kernel only reads gathered rows, so any size works.
@@ -192,9 +193,10 @@ def engram_gate(
 @pl.jit.inline(auto_scope=False)
 def engram_project_nz(
     lookup: pl.Tensor,
-    weight: pl.Tensor[[ENGRAM_K, KV_OUT], pl.BF16, pl.NZ],
+    weight: pl.Tensor,
     output: pl.Tensor,
     tokens: pl.Scalar[pl.INT32],
+    weight_slot: pl.constexpr,
     row_tile: pl.constexpr,
     n_tile: pl.constexpr,
     k_tile: pl.constexpr,
@@ -212,6 +214,8 @@ def engram_project_nz(
             panel_step = 24
         for panel in pl.range(panel_start, KV_OUT // n_tile, panel_step):
             col = panel * n_tile
+            # The two layer matrices occupy consecutive NZ column panels.
+            weight_col = (panel + weight_slot * (KV_OUT // n_tile)) * n_tile
             if columns_first:
                 # Distribute consecutive row tiles of the same weight panel across workers.
                 first_row_tile = (worker + 24 - (panel * row_blocks) % 24) % 24
@@ -228,14 +232,14 @@ def engram_project_nz(
                     if k_subtile > 0:
                         a_panel = pl.load(lookup, [row, k], [row_tile, k_tile], valid_shape=[rows, k_tile],
                                           target_memory=pl.MemorySpace.Mat)
-                        b_panel = pl.load(weight, [k, col], [k_tile, n_tile], target_memory=pl.MemorySpace.Mat)
+                        b_panel = pl.load(weight, [k, weight_col], [k_tile, n_tile], target_memory=pl.MemorySpace.Mat)
                         for inner_k in pl.pipeline(0, k_tile, k_subtile, stage=2):
                             a = pl.tile.slice(a_panel, [row_tile, k_subtile], [0, inner_k])
                             b = pl.tile.slice(b_panel, [k_subtile, n_tile], [inner_k, 0])
                             acc = pl.matmul_acc(acc, a, b, init_cond=(k + inner_k == 0))
                     else:
                         source = pl.load(lookup, [row, k], [row_tile, k_tile], valid_shape=[rows, k_tile])
-                        weights = pl.load(weight, [k, col], [k_tile, n_tile], target_memory=pl.MemorySpace.Mat)
+                        weights = pl.load(weight, [k, weight_col], [k_tile, n_tile], target_memory=pl.MemorySpace.Mat)
                         acc = pl.matmul_acc(acc, source, weights, init_cond=(k == 0))
                 pl.store(pl.set_validshape(acc, rows, n_tile), [row, col], output)
     return output
@@ -245,21 +249,26 @@ def make_engram_from_rows(*, prefill):
     @pl.jit.inline(auto_scope=False)
     def engram_from_rows(
         lookup: pl.Tensor,
-        wkv_weight: pl.Tensor[[ENGRAM_K, KV_OUT], pl.BF16, pl.NZ],
+        wkv_weight: pl.Tensor,
         weight: pl.Tensor[[HC_MULT, D], pl.FP32],
         rotation: pl.Tensor[[D // 32, 32, 32], pl.FP32],
         x: pl.Tensor,
         out: pl.Tensor,
+        weight_slot: pl.constexpr = 0,
     ):
         """Project host-gathered BF16 rows and gate the FP32 residual stream."""
         tokens = pl.tensor.dim(x, 0)
         kv = pl.create_tensor([tokens, KV_OUT], dtype=pl.BF16)
         if prefill and tokens >= PREFILL_MIN_ROWS:
-            engram_project_nz(lookup, wkv_weight, kv, tokens, PREFILL_M_TILE, N_TILE, K_TILE, True, PREFILL_BF16_K_SUBTILE)
+            engram_project_nz(
+                lookup, wkv_weight, kv, tokens, weight_slot, PREFILL_M_TILE, N_TILE, K_TILE, True, PREFILL_BF16_K_SUBTILE,
+            )
         elif not prefill and tokens == 1:
-            engram_project_nz(lookup, wkv_weight, kv, tokens, T_TILE, DECODE_ENGRAM_N_TILE, DECODE_ENGRAM_K_TILE, False, 0)
+            engram_project_nz(
+                lookup, wkv_weight, kv, tokens, weight_slot, T_TILE, DECODE_ENGRAM_N_TILE, DECODE_ENGRAM_K_TILE, False, 0,
+            )
         else:
-            engram_project_nz(lookup, wkv_weight, kv, tokens, 64, N_TILE, K_TILE, False, 0)
+            engram_project_nz(lookup, wkv_weight, kv, tokens, weight_slot, 64, N_TILE, K_TILE, False, 0)
         pl.dump_tag(kv)
         if prefill:
             original_query = pl.create_tensor([tokens, HC_MULT, D], dtype=pl.FP32)
