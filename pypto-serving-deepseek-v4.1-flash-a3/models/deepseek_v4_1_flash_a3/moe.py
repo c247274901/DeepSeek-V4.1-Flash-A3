@@ -24,7 +24,7 @@ from .expert_routed import (
     expert_routed_scatter,
 )
 from .hc import hc_ffn_decode_mixes, hc_pre, hc_post
-from .rmsnorm import prefill_ffn_norm_quant, rms_norm_tiled
+from .rmsnorm import decode_rms_norm_owner_row, prefill_ffn_norm_quant, rms_norm_tiled
 from .o_proj import decode_tp_output_post_token, prefill_tp_output_all_reduce
 
 
@@ -594,6 +594,25 @@ def prepare_prefill_routes(
 
 
 @pl.jit.inline
+def _decode_ffn_owner_norm(
+    source: pl.Tensor[[T_DYN, D], pl.BF16],
+    norm_weight: pl.Tensor[[D], pl.BF16],
+    output: pl.Tensor[[TOKENS, D], pl.BF16],
+    num_tokens: pl.Scalar[pl.INT32],
+    tp_rank: pl.Scalar[pl.INT32],
+    local_tokens: pl.Scalar[pl.INDEX],
+):
+    """Normalize the owner rows, reading a lone row directly from mHC output."""
+    if local_tokens == 1:
+        decode_rms_norm_owner_row(source, norm_weight, output, tp_rank)
+    else:
+        compact = pl.create_tensor([TOKENS, D], dtype=pl.BF16)
+        _compact_local_tokens(source, compact, num_tokens, tp_rank)
+        for block in pl.spmd((TOKENS + 7) // 8, name_hint="rms_norm"):
+            rms_norm_tiled(compact, norm_weight, output, block, TOKENS, output_fp32=False)
+
+
+@pl.jit.inline
 def _scatter_local_tokens(
     compact: pl.Tensor[[T_DYN, D], pl.BF16],
     output: pl.Tensor[[T_DYN, D], pl.BF16],
@@ -694,13 +713,9 @@ def prefill_moe_sublayer(
         shared_output = pl.create_tensor([TOKENS, D], dtype=pl.BF16)
         if local_num_tokens > 0:
             if not prefill:
-                local_ffn_input = pl.create_tensor([TOKENS, D], dtype=pl.BF16)
-                _compact_local_tokens(ffn_input, local_ffn_input, num_tokens, tp_rank)
-                for norm_block in pl.spmd((TOKENS + 7) // 8, name_hint="rms_norm"):
-                    rms_norm_tiled(
-                        local_ffn_input, ffn_norm_weight, local_ffn_normed, norm_block, TOKENS,
-                        output_fp32=False,
-                    )
+                _decode_ffn_owner_norm(
+                    ffn_input, ffn_norm_weight, local_ffn_normed, num_tokens, tp_rank, local_num_tokens,
+                )
                 npu_gate(
                     local_ffn_normed, gate_weight, correction_bias, local_num_tokens,
                     x_norm_mx, x_norm_scale, indices, weights,

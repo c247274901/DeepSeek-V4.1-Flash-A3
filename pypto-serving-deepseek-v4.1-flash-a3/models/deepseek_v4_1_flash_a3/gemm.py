@@ -559,6 +559,11 @@ def expert_down(
                 payload, scale, weight, weight_scale, output, count, width, output_width,
                 hint, PREFILL_EXPERT_DOWN_N_TILE, 256, output_major, 16,
             )
+    elif width == 2304 and output_width == 5120 and count == 1:
+        prefill_gemm_int8_tiled(
+            payload, scale, weight, weight_scale, output, count, width, output_width,
+            hint, 256, 256, output_major, 16,
+        )
     else:
         gemm_int8(payload, scale, weight, weight_scale, output, count, width, output_width, hint, 128, 256, output_major)
     return output
