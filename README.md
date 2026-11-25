@@ -68,25 +68,27 @@ from the `pypto-serving-deepseek-v4.1-flash-a3/` directory.
 
 ## History and validation
 
-The kernel snapshot is tagged `release/1122-kernels` and comes from
-`Adelaide999/pypto-lib` at
-`38c77a9817090609d74728f24bccea9fb1a682ac`. The serving adapter reuses the
-DeepSeek chat renderer and request semantics from `Adelaide999/pypto-serving`
-at `cd818945c3c4e5454b8c259306d4e6f9e865e05c` and binds them to the 1122
-resident programs. Commits record the architecture
-changes and the final kernel optimizations, with the relevant source revisions
-in their commit messages.
+The initial kernel snapshot, tagged `release/1122-kernels`, comes from
+`Adelaide999/pypto-lib` at `38c77a9817090609d74728f24bccea9fb1a682ac`.
+The current model includes the A3 changes through
+`bb4539976b30dfb4c7323664bc1e9e91a5d186af` on `deepseek_v4.1_flash_1122`.
+The update starts at `e90d3ae` and records original revisions in the
+`Source-commit` trailers. The serving adapter reuses the DeepSeek chat renderer
+and request semantics from `Adelaide999/pypto-serving` at
+`cd818945c3c4e5454b8c259306d4e6f9e865e05c`.
 
 Compare `baseline/architecture-before` to `baseline/full-graph-entry`
 for graph integration, and `baseline/pre-flatten` to
 `baseline/architecture-after` for the package refactor. Use `baseline/indexer`
 and `baseline/moe` as the starting points for those kernel changes.
 
-The 8192-row Prefill graph (MoE slab 128) and the 16-row Decode graph
-compiled for A3 at context capacity 8200. Host tests cover the serving routes
-and native Decode staging.
+The current 8192-row Prefill graph (MoE slab 128) and 16-row Decode graph
+compiled for A3 at context capacity 8200. The four Decode staging tests
+passed. Engram weights use the BF16 NZ layout in both graphs. The launcher
+builds fresh graphs for this layout.
 
-On sixteen A3 devices with CANN 9.0, the service loaded the W8A8 checkpoint,
+At the serving baseline `e90d3ae`, on sixteen A3 devices with CANN 9.0, the
+service loaded the W8A8 checkpoint,
 initialized both communication windows, and reported ready on `/health`.
 Two requests to `/v1/completions` each generated three tokens from a
 three-token prompt. The ordinary and streamed responses returned the same
